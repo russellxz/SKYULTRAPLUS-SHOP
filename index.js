@@ -25,10 +25,26 @@ app.set("trust proxy", 1);
 app.use("/public", express.static(path.join(__dirname, "public")));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-/* ===== Parsers ===== */
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+/* ===== Parsers (PARCHE: límites altos, antes de montar rutas) =====
+   15 MB binario ≈ 20 MB en base64 → usamos 50 MB para ir sobrados.
+*/
+app.use(express.json({ limit: "50mb" }));
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: "50mb",
+    parameterLimit: 100000,
+  })
+);
 app.use(cookie());
+
+/* ===== Handler de error por payload grande (opcional pero útil) ===== */
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.too.large") {
+    return res.status(413).type("text/plain").send("Archivo demasiado grande. Máximo 15MB.");
+  }
+  next(err);
+});
 
 /* ===== Seguridad ===== */
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -65,8 +81,8 @@ app.use("/", require("./product"));          // /product y /product/buy
 app.use("/pay", require("./pay"));           // /pay/paypal y /pay/stripe (placeholders)
 app.use("/invoices", require("./invoices")); // Mis facturas (listado/descarga)
 app.use("/", require("./services"));
-app.use('/profile', require('./profile'));
-app.use('/', require('./user_credits'));
+app.use("/profile", require("./profile"));
+app.use("/", require("./user_credits"));
 
 /* ===== Admin =====
    (específicas primero, luego genéricas)
@@ -80,9 +96,9 @@ app.use("/admin/paypal", require("./admin_paypal"));
 app.use("/pay", require("./pay_paypal"));
 app.use(require("./pay_paypal"));
 app.use("/admin", require("./admin_store"));
-app.use("/admin", require("./admin_user_edit")); 
+app.use("/admin", require("./admin_user_edit"));
 app.use("/tickets", require("./tickets"));
-app.use('/admin', require('./admin_tickets'));
+app.use("/admin", require("./admin_tickets"));
 
 /* Logout */
 app.get("/logout", (req, res) => req.session.destroy(() => res.redirect("/login")));
@@ -102,7 +118,7 @@ const server = app.listen(PORT, HOST, () =>
    - BILLING_ENABLED=0 para desactivarlo
    - BILLING_INTERVAL_MS=30000 para cambiar el intervalo
 */
-const BILLING_ENABLED    = String(process.env.BILLING_ENABLED || "1") !== "0";
+const BILLING_ENABLED     = String(process.env.BILLING_ENABLED || "1") !== "0";
 const BILLING_INTERVAL_MS = parseInt(process.env.BILLING_INTERVAL_MS || "30000", 10);
 
 if (BILLING_ENABLED) {
