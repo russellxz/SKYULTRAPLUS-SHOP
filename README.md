@@ -89,7 +89,7 @@
 
 ---
 
-## 🛒 Demo / Compra
+## 🛒 Compra
 <p>
   <a href="https://dash.skyultraplus.com/products/paginas-web" target="_blank">
     <img src="https://img.shields.io/badge/Ir%20a%20la%20tienda-Dashboard-22c55e?style=for-the-badge">
@@ -101,33 +101,3 @@
 ## ⚙️ Configuración rápida
 > Todas las credenciales se pueden guardar desde **Admin → Ajustes**.  
 > Si prefieres variables de entorno, usa nombres como los siguientes (ejemplo):
-
-```env
-# PayPal (Checkout API)
-PAYPAL_API_ENABLED=1
-PAYPAL_API_MODE=sandbox   # o: live
-PAYPAL_API_CLIENT_ID=tu_client_id
-PAYPAL_API_SECRET=tu_secret
-
-# PayPal (IPN por si lo usas como respaldo)
-PAYPAL_IPN_ENABLED=1
-PAYPAL_IPN_EMAIL=tu-correo-paypal@dominio.com
-
-# Stripe (tarjeta)
-STRIPE_PUBLIC_KEY=pk_live_xxx
-STRIPE_SECRET_KEY=sk_live_xxx
-
-# SMTP (verificación de cuenta y notificaciones)
-SMTP_HOST=smtp.tuemail.com
-SMTP_PORT=587
-SMTP_USER=no-reply@tu-dominio.com
-SMTP_PASS=contraseña-segura
-SMTP_FROM="Sky Ultra Plus <no-reply@tu-dominio.com>"
-
-# Marca de tu sitio
-SITE_NAME="Tu Marca"
-LOGO_URL="https://ruta-a-tu-logo.png"
-
-# WhatsApp (contacto y comunidad)
-WHATSAPP_NUMBER_URL="https://wa.me/<TU_NUMERO>"
-WHATSAPP_GROUP_URL="https://chat.whatsapp.com/<TU_GRUPO>"
