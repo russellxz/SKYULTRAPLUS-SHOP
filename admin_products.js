@@ -8,6 +8,15 @@ const db = require("./db");
 
 const router = express.Router();
 
+/* ========= límites de subida ========= */
+// Permitimos 15 MB reales (binario). Como el base64 agrega ~33%,
+// ponemos el parser en 30 MB para ir sobrados.
+const MAX_IMAGE_MB = 15;
+const PARSER_LIMIT = "30mb";
+
+// Parser GRANDE solo para este router (evita el PayloadTooLargeError)
+const parseLarge = express.urlencoded({ limit: PARSER_LIMIT, extended: true });
+
 /* ========= helpers ========= */
 function ensureAdmin(req,res,next){
   const u = req.session && req.session.user;
@@ -308,17 +317,17 @@ router.get("/new", ensureAdmin, (req,res)=>{
           <div>
             <label>Moneda</label>
             <select class="input" name="currency">
-              <option ${sel('USD')} value="USD">USD</option>
-              <option ${sel('MXN')} value="MXN">MXN</option>
+              <option ${p.currency==='USD'?'selected':''} value="USD">USD</option>
+              <option ${p.currency==='MXN'?'selected':''} value="MXN">MXN</option>
             </select>
           </div>
           <div>
             <label>Periodo de facturación</label>
             <select class="input" name="period_minutes" required>
-              <option ${selPeriod(3)} value="3">TEST · 3 minutos</option>
-              <option ${selPeriod(10080)} value="10080">Semanal (1 semana)</option>
-              <option ${selPeriod(21600)} value="21600">15 días</option>
-              <option ${selPeriod(43200)} value="43200">Mensual (30 días)</option>
+              <option ${p.period_minutes==3?'selected':''} value="3">TEST · 3 minutos</option>
+              <option ${p.period_minutes==10080?'selected':''} value="10080">Semanal (1 semana)</option>
+              <option ${p.period_minutes==21600?'selected':''} value="21600">15 días</option>
+              <option ${p.period_minutes==43200?'selected':''} value="43200">Mensual (30 días)</option>
             </select>
           </div>
           <div>
@@ -351,7 +360,7 @@ router.get("/new", ensureAdmin, (req,res)=>{
   </main>
 
 <script>
-  // Animaciones
+  // Animaciones (igual que antes)
   (function(){
     const sky=document.getElementById('sky');
     for(let i=0;i<90;i++){
@@ -398,7 +407,7 @@ router.get("/new", ensureAdmin, (req,res)=>{
     btn.addEventListener('click', ()=>apply(document.body.classList.contains('light')?'dark':'light'));
   })();
 
-  // Imagen -> base64
+  // Imagen -> base64 (previsualización)
   (function(){
     const file = document.getElementById('file');
     const out  = document.getElementById('image_b64');
@@ -434,7 +443,7 @@ router.get("/new", ensureAdmin, (req,res)=>{
 });
 
 /* ========= POST crear/editar ========= */
-router.post("/new", ensureAdmin, (req,res)=>{
+router.post("/new", ensureAdmin, parseLarge, (req,res)=>{
   ensureSchema();
   const id = Number(req.body?.id||0);
   const name = String(req.body?.name||"").trim();
@@ -462,13 +471,18 @@ router.post("/new", ensureAdmin, (req,res)=>{
   }
   const pid = id || db.prepare(`SELECT last_insert_rowid() AS id`).get().id;
 
-  // guardar imagen si llegó base64
+  // guardar imagen si llegó base64 (con validación de 15 MB reales)
   if (b64.startsWith("data:image/")){
+    const raw = b64.split(",")[1] || "";
+    const bytes = Buffer.byteLength(raw, "base64");
+    const maxBytes = MAX_IMAGE_MB * 1024 * 1024;
+    if (bytes > maxBytes){
+      return res.status(413).send(`La imagen supera ${MAX_IMAGE_MB}MB (${(bytes/1024/1024).toFixed(1)}MB).`);
+    }
     const dir = path.join(process.cwd(),"uploads","products");
     try{ fs.mkdirSync(dir,{recursive:true}); }catch{}
     const fpath = path.join(dir, `${pid}.png`);
-    const data = b64.split(",")[1];
-    fs.writeFileSync(fpath, Buffer.from(data,"base64"));
+    fs.writeFileSync(fpath, Buffer.from(raw,"base64"));
     const image_path = `/uploads/products/${pid}.png`;
     db.prepare(`UPDATE products SET image_path=? WHERE id=?`).run(image_path, pid);
   }
