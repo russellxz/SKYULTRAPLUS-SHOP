@@ -1,4 +1,5 @@
 // admin_invoices.js — Admin: ver/buscar/descargar/eliminar/cancelar servicios (claro/oscuro)
+// Incluye pestaña de "Pagos únicos" (facturas de productos one_time)
 "use strict";
 
 const express = require("express");
@@ -157,6 +158,7 @@ router.get("/", ensureAdmin, (req, res) => {
         <div class="seg" role="tablist">
           <button id="tabBtnInvoices" class="active" data-tab="invoices" type="button">Facturas</button>
           <button id="tabBtnUnpaid" data-tab="unpaid" type="button">Pendientes</button>
+          <button id="tabBtnOneTime" data-tab="one_time" type="button">Pagos únicos</button>
           <button id="tabBtnCanceled" data-tab="canceled" type="button">Cancelados</button>
         </div>
         <input id="q" class="input" placeholder="Buscar… (INV-..., @usuario, correo, nombre, producto)">
@@ -222,6 +224,36 @@ router.get("/", ensureAdmin, (req, res) => {
         </div>
       </div>
 
+      <!-- TAB PAGOS ÚNICOS -->
+      <div id="tabOneTime" style="display:none">
+        <div class="actionsbar">
+          <label><input id="chkAllOne" class="sel" type="checkbox"> Seleccionar todo</label>
+          <button id="bulkDelOne" class="btn red" type="button" disabled>Eliminar seleccionadas</button>
+        </div>
+        <div class="tablewrap">
+          <table id="tblOne">
+            <thead>
+              <tr>
+                <th class="selcol"></th>
+                <th class="hide-sm">ID</th>
+                <th>Número</th>
+                <th>Usuario</th>
+                <th class="hide-sm">Email</th>
+                <th class="hide-sm">Producto</th>
+                <th>Monto</th>
+                <th>Estado</th>
+                <th class="hide-sm">Método</th>
+                <th class="hide-sm">Fecha</th>
+                <th class="right">Acciones</th>
+              </tr>
+            </thead>
+            <tbody id="tbodyOne">
+              <tr><td colspan="11" class="muted">Cargando…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- TAB CANCELADOS -->
       <div id="tabCanceled" style="display:none">
         <div class="actionsbar">
@@ -271,6 +303,7 @@ router.get("/", ensureAdmin, (req, res) => {
   var q = document.getElementById('q');
   var tabInv=document.getElementById('tabInvoices');
   var tabUnp=document.getElementById('tabUnpaid');
+  var tabOne=document.getElementById('tabOneTime');
   var tabCan=document.getElementById('tabCanceled');
   var currentTab = localStorage.getItem('admin:invTab') || 'invoices';
   var t=null; function debounce(fn,ms){ clearTimeout(t); t=setTimeout(fn,ms||220); }
@@ -282,21 +315,25 @@ router.get("/", ensureAdmin, (req, res) => {
     currentTab = t;
     tabInv.style.display = (t==='invoices') ? 'block':'none';
     tabUnp.style.display  = (t==='unpaid')   ? 'block':'none';
+    tabOne.style.display  = (t==='one_time') ? 'block':'none';
     tabCan.style.display  = (t==='canceled') ? 'block':'none';
     document.getElementById('tabBtnInvoices').classList.toggle('active',t==='invoices');
     document.getElementById('tabBtnUnpaid').classList.toggle('active',t==='unpaid');
+    document.getElementById('tabBtnOneTime').classList.toggle('active',t==='one_time');
     document.getElementById('tabBtnCanceled').classList.toggle('active',t==='canceled');
     localStorage.setItem('admin:invTab', t);
     load();
   }
   document.getElementById('tabBtnInvoices').onclick=()=>setTab('invoices');
   document.getElementById('tabBtnUnpaid').onclick =()=>setTab('unpaid');
+  document.getElementById('tabBtnOneTime').onclick =()=>setTab('one_time');
   document.getElementById('tabBtnCanceled').onclick=()=>setTab('canceled');
 
   /* cargar según tab */
   async function load(){
     if (currentTab==='invoices') return loadInvoices();
     if (currentTab==='unpaid')   return loadUnpaid();
+    if (currentTab==='one_time') return loadOneTime();
     return loadCanceled();
   }
 
@@ -375,6 +412,44 @@ router.get("/", ensureAdmin, (req, res) => {
     toggleBulkBtns();
   }
 
+  /* ===== PAGOS ÚNICOS ===== */
+  async function loadOneTime(){
+    try{
+      var r=await fetch('/admin/invoices/api/one_time?q='+encodeURIComponent(q.value.trim()),{credentials:'same-origin',cache:'no-store'});
+      var data=await r.json();
+      renderOneTime(Array.isArray(data)?data:[]);
+    }catch(e){
+      document.getElementById('tbodyOne').innerHTML='<tr><td colspan="11">Error cargando</td></tr>';
+    }
+  }
+  function renderOneTime(rows){
+    var tb=document.getElementById('tbodyOne');
+    if(!rows.length){ tb.innerHTML='<tr><td colspan="11" class="muted">No hay facturas de pagos únicos.</td></tr>'; toggleBulkBtns(); return; }
+    var h='';
+    rows.forEach(x=>{
+      var status=x.status||'paid';
+      h+=
+      '<tr data-id="'+x.id+'">'
+      +  '<td><input class="sel" type="checkbox" name="selOne"></td>'
+      +  '<td class="hide-sm">'+x.id+'</td>'
+      +  '<td class="nowrap">'+esc(x.number||'—')+'</td>'
+      +  '<td class="ellipsis">@'+esc(x.username||'')+' · '+esc((x.name||"")+" "+(x.surname||"")).trim()+'</td>'
+      +  '<td class="hide-sm ellipsis">'+esc(x.email||'')+'</td>'
+      +  '<td class="hide-sm ellipsis">'+esc(x.product_name||'—')+'</td>'
+      +  '<td>'+fmtAmt(x.amount,x.currency)+'</td>'
+      +  '<td><span class="tag">'+esc(status)+'</span></td>'
+      +  '<td class="hide-sm">'+esc(x.payment_method||'—')+'</td>'
+      +  '<td class="hide-sm nowrap">'+esc((x.created_at||'').replace('T',' ').slice(0,19))+'</td>'
+      +  '<td class="right">'
+      +     (x.external_id?('<a class="btn ghost" href="'+esc(x.external_id)+'" target="_blank" rel="noopener">PDF</a>'):'')
+      +     '<button class="btn red" data-del>Eliminar</button>'
+      +  '</td>'
+      +'</tr>';
+    });
+    tb.innerHTML=h;
+    toggleBulkBtns();
+  }
+
   /* ===== CANCELADOS ===== */
   async function loadCanceled(){
     try{
@@ -414,9 +489,11 @@ router.get("/", ensureAdmin, (req, res) => {
   function toggleBulkBtns(){
     var invSel = getSelectedIds('tbodyInv','data-id');
     var unpSel = getSelectedIds('tbodyUnp','data-id');
+    var oneSel = getSelectedIds('tbodyOne','data-id');
     var canSel = getSelectedIds('tbodyCan','data-service-id');
     document.getElementById('bulkDelInv').disabled = invSel.length===0;
     document.getElementById('bulkDelUnp').disabled = unpSel.length===0;
+    document.getElementById('bulkDelOne').disabled = oneSel.length===0;
     document.getElementById('bulkDelCan').disabled = canSel.length===0;
   }
   document.addEventListener('change', e=>{
@@ -426,6 +503,10 @@ router.get("/", ensureAdmin, (req, res) => {
     }
     if (e.target.matches('#chkAllUnp')) {
       document.querySelectorAll('#tbodyUnp input.sel').forEach(c=>c.checked=e.target.checked);
+      toggleBulkBtns(); return;
+    }
+    if (e.target.matches('#chkAllOne')) {
+      document.querySelectorAll('#tbodyOne input.sel').forEach(c=>c.checked=e.target.checked);
       toggleBulkBtns(); return;
     }
     if (e.target.matches('#chkAllCan')) {
@@ -454,22 +535,32 @@ router.get("/", ensureAdmin, (req, res) => {
     const t = await r.text(); if(t!=='OK'){ alert(t); return; }
     load();
   });
+  document.getElementById('bulkDelOne').addEventListener('click', async ()=>{
+    var ids=getSelectedIds('tbodyOne','data-id');
+    if(!ids.length) return;
+    if(!confirm('¿Eliminar '+ids.length+' factura(s) de pagos únicos?')) return;
+    const url='/admin/invoices/api/bulk?ids='+encodeURIComponent(ids.join(','));
+    const r = await fetch(url,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+    const t = await r.text(); if(t!=='OK'){ alert(t); return; }
+    load();
+  });
 
-  // borrar en lote: cancelados (servicios)
+  // borrar en lote: servicios cancelados (⚠️ lo que faltaba)
   document.getElementById('bulkDelCan').addEventListener('click', async ()=>{
     var service_ids=getSelectedIds('tbodyCan','data-service-id');
     if(!service_ids.length) return;
     if(!confirm('¿Eliminar definitivamente '+service_ids.length+' servicio(s) cancelado(s)? Se borrarán sus facturas.')) return;
     const url='/admin/invoices/api/canceled/bulk?service_ids='+encodeURIComponent(service_ids.join(','));
-    const r = await fetch(url,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({service_ids})});
+    const r = await fetch(url,{
+      method:'DELETE',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ service_ids })
+    });
     const t = await r.text(); if(t!=='OK'){ alert(t); return; }
     load();
   });
 
-  document.getElementById('refreshBtn').addEventListener('click',load);
-  q.addEventListener('input',()=>debounce(load,220));
-
-  /* acciones por fila (delete + cancel-service) */
+  /* acciones por fila (delete + cancel-service donde aplica) */
   function actionHandler(e){
     var tr=e.target.closest('tr'); if(!tr) return;
     var id=Number(tr.getAttribute('data-id')||0); if(!id) return;
@@ -502,6 +593,11 @@ router.get("/", ensureAdmin, (req, res) => {
   }
   document.getElementById('tbodyInv').addEventListener('click', actionHandler);
   document.getElementById('tbodyUnp').addEventListener('click', actionHandler);
+  // En pagos únicos no mostramos "cancelar servicio", sólo eliminar/PDF
+  document.getElementById('tbodyOne').addEventListener('click', actionHandler);
+
+  document.getElementById('refreshBtn').addEventListener('click',load);
+  q.addEventListener('input',()=>debounce(load,220));
 
   setTab(currentTab);
 })();
@@ -580,6 +676,44 @@ router.get("/api/unpaid", ensureAdmin, (req, res) => {
       LEFT JOIN users u ON u.id=i.user_id
       LEFT JOIN products p ON p.id=i.product_id
       WHERE ${whereStatus}
+      ORDER BY datetime(i.created_at) DESC, i.id DESC
+      LIMIT 150
+    `).all();
+  }
+  res.json(rows);
+});
+
+/* ===== API: facturas de pagos únicos ===== */
+router.get("/api/one_time", ensureAdmin, (req, res) => {
+  const q = String(req.query.q || "").trim();
+  const whereOne = `LOWER(COALESCE(p.billing_type,''))='one_time' OR COALESCE(p.period_minutes,0)=0`;
+  let rows;
+  if (q) {
+    const like = `%${q}%`;
+    rows = db.prepare(`
+      SELECT i.id, i.number, i.amount, i.currency, i.status, i.payment_method,
+             i.external_id, i.created_at, i.user_id, i.product_id,
+             u.username, u.name, u.surname, u.email,
+             p.name AS product_name
+      FROM invoices i
+      LEFT JOIN users u ON u.id=i.user_id
+      JOIN products p ON p.id=i.product_id
+      WHERE (${whereOne}) AND (
+            i.number LIKE ? OR u.username LIKE ? OR u.name LIKE ? OR u.surname LIKE ? OR u.email LIKE ? OR p.name LIKE ?
+      )
+      ORDER BY datetime(i.created_at) DESC, i.id DESC
+      LIMIT 300
+    `).all(like, like, like, like, like, like);
+  } else {
+    rows = db.prepare(`
+      SELECT i.id, i.number, i.amount, i.currency, i.status, i.payment_method,
+             i.external_id, i.created_at, i.user_id, i.product_id,
+             u.username, u.name, u.surname, u.email,
+             p.name AS product_name
+      FROM invoices i
+      LEFT JOIN users u ON u.id=i.user_id
+      JOIN products p ON p.id=i.product_id
+      WHERE (${whereOne})
       ORDER BY datetime(i.created_at) DESC, i.id DESC
       LIMIT 150
     `).all();
@@ -669,12 +803,10 @@ function getIdsFromReq(req, fieldName) {
   if (req.query && (req.query[fieldName] != null)) raw = raw.concat(req.query[fieldName]);
   if (req.query && (req.query[`${fieldName}[]`] != null)) raw = raw.concat(req.query[`${fieldName}[]`]);
   const flat = extractNumericIds(raw).map(n => Number(n)).filter(Boolean);
-  // Quita duplicados
   return Array.from(new Set(flat));
 }
 
 /* ===== API: eliminar facturas en lote ===== */
-// Acepta DELETE y POST para máxima compatibilidad
 const bulkDeleteInvoices = (req, res) => {
   const ids = getIdsFromReq(req, "ids");
   if (!ids.length) return res.status(400).send("Faltan ids");
