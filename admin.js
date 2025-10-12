@@ -146,6 +146,7 @@ router.get("/", ensureAdmin, (req, res) => {
       <div class="row">
         <a class="btn blue" href="/admin/paypal">Configurar PayPal</a>
         <a class="btn blue" href="/admin/stripe">Configurar Stripe</a>
+        <a class="btn blue" href="/admin/whatsapp">Vincular WhatsApp (Bot)</a>
       </div>
     </section>
 
