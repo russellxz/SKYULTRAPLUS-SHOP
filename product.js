@@ -15,6 +15,7 @@ function ensureAuth(req, res, next) {
   next();
 }
 const get = (k, d = "") => db.getSetting(k, d);
+const FAR_FUTURE = "2099-12-31T00:00:00.000Z";
 
 function baseUrl(req) {
   const proto =
@@ -23,6 +24,16 @@ function baseUrl(req) {
   const host =
     req.headers["x-forwarded-host"] || req.headers.host || "localhost";
   return `${proto}://${host}`;
+}
+
+function tryDeletePDF(external_id) {
+  if (!external_id) return;
+  const rel = String(external_id).replace(/^\/+/, "");
+  const abs = path.resolve(process.cwd(), rel);
+  const safeBase = path.resolve(process.cwd(), "uploads", "invoices");
+  if (abs.startsWith(safeBase)) {
+    try { if (fs.existsSync(abs)) fs.unlinkSync(abs); } catch {}
+  }
 }
 
 // Solo aseguramos services (invoices ya las crea db.js)
@@ -42,6 +53,18 @@ function ensureSchema() {
   `).run();
 }
 ensureSchema();
+
+/* ==== util: etiquetas de periodo/tipo ==== */
+function periodLabel(pm) {
+  if (pm === 3) return "TEST · 3 min";
+  if (pm === 10080) return "Semanal";
+  if (pm === 21600) return "Cada 15 días";
+  return "Mensual";
+}
+function typeLabel(product) {
+  const isOneTime = String(product.billing_type) === "one_time" || Number(product.period_minutes) === 0;
+  return isOneTime ? "Pago único" : periodLabel(Number(product.period_minutes || 43200));
+}
 
 /* ==== util: siguiente número de factura ==== */
 function nextInvoiceNumber() {
@@ -97,18 +120,17 @@ async function createInvoicePDF({
   doc.text(`Teléfono: ${user.phone || "—"}`);
 
   // Producto
+  const isOneTime = String(product.billing_type) === "one_time" || Number(product.period_minutes) === 0;
+  const renewText = isOneTime ? "Pago único" : periodLabel(Number(product.period_minutes || 43200));
+
   doc.moveDown(1);
   doc.fillColor("#111827").fontSize(15).text("Detalle del producto");
-  const renew =
-    product.period_minutes === 3 ? "TEST · 3 min" :
-    product.period_minutes === 10080 ? "Semanal" :
-    product.period_minutes === 21600 ? "Cada 15 días" : "Mensual";
   doc.moveDown(0.2);
   doc.fillColor("#374151").fontSize(11);
   doc.text(`Producto: ${product.name}`);
   doc.text(`Descripción: ${product.description || "—"}`);
-  doc.text(`Renovación: ${renew}`);
-  doc.text(`Próximo ciclo hasta: ${new Date(cycleEnd).toLocaleString()}`);
+  doc.text(`Tipo: ${renewText}`);
+  doc.text(`Próximo ciclo hasta: ${isOneTime ? "—" : new Date(cycleEnd).toLocaleString()}`);
 
   // Resumen
   doc.moveDown(1);
@@ -137,17 +159,27 @@ router.get("/product", ensureAuth, (req, res) => {
   const p = db.prepare(`SELECT * FROM products WHERE id=? AND active=1`).get(id);
   if (!p) return res.status(404).send("Producto no encontrado");
 
+  const isOneTime = String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0;
+  const userHasActive = !!db.prepare(`SELECT 1 FROM services WHERE user_id=? AND product_id=? AND status='active'`).get(u.id, p.id);
+  const outOfStock = (typeof p.stock === "number") && p.stock === 0;
+
   // Saldos
   const balUSD = db.prepare(`SELECT balance FROM credits WHERE user_id=? AND currency='USD'`).get(u.id)?.balance || 0;
   const balMXN = db.prepare(`SELECT balance FROM credits WHERE user_id=? AND currency='MXN'`).get(u.id)?.balance || 0;
 
-  // Renovación (texto)
-  const renew =
-    p.period_minutes === 3 ? "TEST · 3 minutos" :
-    p.period_minutes === 10080 ? "Cada semana" :
-    p.period_minutes === 21600 ? "Cada 15 días" : "Mensual";
+  // Texto tipo
+  const tipo = typeLabel(p);
 
-  const canPay = (p.currency === "USD" ? balUSD : balMXN) >= p.price;
+  // Deshabilitar compra si corresponde
+  const disableReason = outOfStock
+    ? "Sin stock"
+    : (isOneTime && userHasActive)
+      ? "Ya comprado"
+      : "";
+
+  const canPayByCredits = disableReason
+    ? false
+    : ((p.currency === "USD" ? balUSD : balMXN) >= p.price);
 
   // ===== flags PayPal =====
   const ppApiEnabled = get("paypal_api_enabled", "0") === "1"
@@ -162,6 +194,10 @@ router.get("/product", ensureAuth, (req, res) => {
     : "https://www.sandbox.paypal.com/cgi-bin/webscr";
   const base = baseUrl(req);
   const ipnNotify = `${base}/pay/paypal/ipn`; // tu listener IPN
+
+  const stockText = (typeof p.stock === "number")
+    ? (p.stock < 0 ? "∞" : String(p.stock))
+    : "—";
 
   res.type("html").send(`<!doctype html>
 <html lang="es">
@@ -217,6 +253,9 @@ router.get("/product", ensureAuth, (req, res) => {
   .opt{display:flex;align-items:center;gap:10px;border:1px solid #ffffff22;border-radius:12px;padding:12px;margin:8px 0;cursor:pointer;background:#0f172a}
   body.light .opt{background:#f8fafc;border-color:#00000018}
   .opt small{opacity:.8}
+  .badges{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0}
+  .badge{display:inline-block;font-size:12px;padding:4px 8px;border-radius:999px;border:1px solid #ffffff24;background:#0b1325;color:#cbd5e1}
+  body.light .badge{background:#f8fafc;color:#0b1220;border-color:#00000018}
 </style>
 <body>
   <div class="sky" id="sky"></div>
@@ -237,21 +276,26 @@ router.get("/product", ensureAuth, (req, res) => {
       <section class="card">
         <h1 style="margin:0 0 6px">${p.name}</h1>
         <div class="muted" style="margin-bottom:8px">${p.description || ''}</div>
+        <div class="badges">
+          <span class="badge" title="Tipo de cobro">${tipo}</span>
+          <span class="badge" title="Stock">Stock: ${stockText}</span>
+        </div>
         <div style="font-size:22px;font-weight:900;margin:10px 0">${p.currency} ${Number(p.price).toFixed(2)}</div>
-        <div class="muted">Renovación: ${renew}</div>
         <div class="muted" style="margin:6px 0 12px">Tu saldo — USD: $${Number(balUSD).toFixed(2)} · MXN: ${Number(balMXN).toFixed(2)}</div>
 
         <form method="post" action="/product/buy" class="row" style="margin-top:6px">
           <input type="hidden" name="id" value="${p.id}">
-          <button class="btn" type="submit" ${canPay ? '' : 'disabled title="Saldo insuficiente"'}>Pagar con créditos</button>
+          <button class="btn" type="submit" ${canPayByCredits ? '' : 'disabled title="' + (disableReason || 'Saldo insuficiente') + '"'}>Pagar con créditos</button>
           <a class="pill" href="/comprar-creditos?currency=${p.currency}">Recargar créditos</a>
         </form>
 
         <div class="paycard">
-          <button id="paypalBtn" class="altpay" ${(!ppApiEnabled && !ppIpnEnabled)?'disabled':''}
-            title="${(!ppApiEnabled && !ppIpnEnabled)?'PayPal no disponible':''}">PayPal</button>
-          <a class="altpay" href="/pay/stripe?pid=${p.id}" title="Pagar con Stripe">Stripe</a>
+          <button id="paypalBtn" class="altpay" ${(disableReason || (!ppApiEnabled && !ppIpnEnabled)) ? 'disabled' : ''}
+            title="${disableReason || ((!ppApiEnabled && !ppIpnEnabled) ? 'PayPal no disponible' : '')}">PayPal</button>
+          <a class="altpay" ${disableReason ? 'aria-disabled="true" tabindex="-1" style="pointer-events:none;opacity:.4"' : ''} href="/pay/stripe?pid=${p.id}" title="Pagar con Stripe">Stripe</a>
         </div>
+
+        ${disableReason ? `<div class="muted" style="margin-top:8px">No disponible: ${disableReason}.</div>` : ``}
       </section>
     </div>
   </main>
@@ -305,7 +349,7 @@ router.get("/product", ensureAuth, (req, res) => {
   </div>
 
 <script>
-  // Animaciones: estrellas (oscuro) + emojis (claro)
+  // Animaciones + tema + flujo PayPal (igual que antes)
   (function(){
     const sky = document.getElementById('sky');
     for(let i=0;i<90;i++){
@@ -335,10 +379,7 @@ router.get("/product", ensureAuth, (req, res) => {
       sp.style.animationDelay=(Math.random()*8).toFixed(1)+'s';
       icons.appendChild(sp);
     }
-  })();
 
-  // Tema
-  (function(){
     const btn=document.getElementById('modeBtn');
     function apply(mode){
       const light=(mode==='light');
@@ -350,22 +391,21 @@ router.get("/product", ensureAuth, (req, res) => {
     }
     apply(localStorage.getItem('ui:mode') || 'dark');
     btn.addEventListener('click', ()=>apply(document.body.classList.contains('light')?'dark':'light'));
-  })();
 
-  // PayPal selector + creación de factura y envío al flujo
-  (function(){
     const apiReady = ${ppApiEnabled ? 'true' : 'false'};
     const ipnReady = ${ppIpnEnabled ? 'true' : 'false'};
     const pid = ${p.id};
     const base = ${JSON.stringify(base)};
-
-    const btn = document.getElementById('paypalBtn');
+    const disabledReason = ${JSON.stringify(disableReason)};
     const modal = document.getElementById('ppModal');
+    const ppBtn = document.getElementById('paypalBtn');
 
     function openModal(){ modal.classList.add('show'); modal.setAttribute('aria-hidden','false'); }
     function closeModal(){ modal.classList.remove('show'); modal.setAttribute('aria-hidden','true'); }
 
-    btn?.addEventListener('click', ()=>{
+    if (disabledReason && ppBtn) { ppBtn.disabled = true; ppBtn.title = disabledReason; }
+    ppBtn?.addEventListener('click', ()=>{
+      if (disabledReason) { alert(disabledReason); return; }
       if (!apiReady && !ipnReady) { alert('PayPal no está disponible.'); return; }
       if (apiReady && ipnReady) openModal();
       else if (apiReady) startAndGo('api');
@@ -379,7 +419,6 @@ router.get("/product", ensureAuth, (req, res) => {
 
     async function startAndGo(kind){
       try{
-        // Crear o reutilizar factura pendiente para este producto
         const body = new URLSearchParams();
         body.set('id', String(pid));
         const r = await fetch('/product/paypal/start', {
@@ -397,15 +436,13 @@ router.get("/product", ensureAuth, (req, res) => {
         const invNumber = data.number;
 
         if (kind==='api'){
-          // PayPal API (tu endpoint hará capture/approve y luego redirigirá a /invoices/confirm/:id)
           document.querySelector('#ppApiForm input[name="invoice_id"]').value = String(invoiceId);
           document.getElementById('ppApiForm').submit();
         }else{
-          // IPN clásico: volvemos SIEMPRE a /invoices/confirm/:id (y NO a /invoices/pay/:id)
           const f = document.getElementById('ppIpnForm');
           const attempt = Date.now().toString(36);
           f.invoice.value = String(invNumber || ('INV-' + invoiceId)) + '-' + attempt;
-          f.custom.value  = String(invoiceId); // para que el IPN encuentre la factura
+          f.custom.value  = String(invoiceId);
           f.return.value  = base + '/invoices/confirm/' + String(invoiceId) + '?paid=paypal_ipn';
           f.cancel_return.value = base + '/invoices/confirm/' + String(invoiceId) + '?canceled=1';
           f.submit();
@@ -422,73 +459,142 @@ router.get("/product", ensureAuth, (req, res) => {
 </html>`);
 });
 
-/* ===== POST pagar con créditos (compra directa) ===== */
+/* ===== POST pagar con créditos (compra directa) =====
+   Descuenta stock SOLO si se paga (transacción) y bloquea pago único ya adquirido.
+   FIX: reusa factura pendiente (por product_id O service_id) y limpia duplicadas. */
 router.post("/product/buy", ensureAuth, async (req, res) => {
   ensureSchema();
-  const uSession = req.session.user;
+  const u = req.session.user;
   const id = Number(req.body?.id || 0);
   const p = db.prepare(`SELECT * FROM products WHERE id=? AND active=1`).get(id);
   if (!p) return res.status(400).send("Producto inválido");
 
+  const isOneTime = String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0;
+
+  // Bloqueo: pago único ya activo
+  if (isOneTime) {
+    const hasActive = !!db.prepare(`SELECT 1 FROM services WHERE user_id=? AND product_id=? AND status='active'`).get(u.id, p.id);
+    if (hasActive) return res.status(400).send("Este producto de pago único ya fue adquirido.");
+  }
+
+  // Bloqueo: sin stock
+  const outOfStock = (typeof p.stock === "number") && p.stock === 0;
+  if (outOfStock) return res.status(400).send("Sin stock.");
+
+  // Saldo
   const cur = p.currency;
-  const bal = db.prepare(`SELECT balance FROM credits WHERE user_id=? AND currency=?`).get(uSession.id, cur)?.balance || 0;
+  const bal = db.prepare(`SELECT balance FROM credits WHERE user_id=? AND currency=?`).get(u.id, cur)?.balance || 0;
   if (bal < p.price) return res.status(400).send("Saldo insuficiente");
 
   const now = new Date();
-  const nextDue = new Date(now.getTime() + p.period_minutes * 60 * 1000);
-  const number = nextInvoiceNumber();
+  const pm = Number(p.period_minutes || 43200);
+  const isRecurring = !isOneTime;
+  const nextDue = isRecurring ? new Date(now.getTime() + pm * 60 * 1000) : new Date(FAR_FUTURE); // para únicos, muy lejos
 
-  const result = db.transaction(() => {
-    // Descuenta créditos
-    db.prepare(`INSERT OR IGNORE INTO credits(user_id,currency,balance) VALUES(?,?,0)`).run(uSession.id, cur);
-    db.prepare(`UPDATE credits SET balance = balance - ? WHERE user_id=? AND currency=?`).run(p.price, uSession.id, cur);
+  try {
+    const result = db.transaction(() => {
+      // 1) Stock
+      if (typeof p.stock === "number" && p.stock >= 0) {
+        const upd = db.prepare(`
+          UPDATE products
+          SET stock = stock - 1
+          WHERE id=? AND stock > 0
+        `).run(p.id);
+        if (upd.changes === 0) throw new Error("Sin stock.");
+      }
 
-    // Servicio
-    let svc = db.prepare(`SELECT * FROM services WHERE user_id=? AND product_id=?`).get(uSession.id, p.id);
-    if (!svc) {
-      db.prepare(`INSERT INTO services(user_id,product_id,period_minutes,next_invoice_at,status) VALUES(?,?,?,?, 'active')`)
-        .run(uSession.id, p.id, p.period_minutes, nextDue.toISOString());
-    } else {
-      db.prepare(`UPDATE services SET period_minutes=?, next_invoice_at=?, status='active' WHERE id=?`)
-        .run(p.period_minutes, nextDue.toISOString(), svc.id);
+      // 2) Descuenta créditos
+      db.prepare(`INSERT OR IGNORE INTO credits(user_id,currency,balance) VALUES(?,?,0)`).run(u.id, cur);
+      db.prepare(`UPDATE credits SET balance = balance - ? WHERE user_id=? AND currency=?`).run(p.price, u.id, cur);
+
+      // 3) Servicio
+      let svc = db.prepare(`SELECT * FROM services WHERE user_id=? AND product_id=?`).get(u.id, p.id);
+      if (!svc) {
+        db.prepare(`
+          INSERT INTO services(user_id,product_id,period_minutes,next_invoice_at,status)
+          VALUES(?,?,?,?, 'active')
+        `).run(u.id, p.id, isRecurring ? pm : 0, nextDue.toISOString());
+        svc = db.prepare(`SELECT * FROM services WHERE user_id=? AND product_id=?`).get(u.id, p.id);
+      } else {
+        db.prepare(`
+          UPDATE services SET period_minutes=?, next_invoice_at=?, status='active' WHERE id=?
+        `).run(isRecurring ? pm : 0, nextDue.toISOString(), svc.id);
+      }
+
+      const nowISO = now.toISOString();
+      const cycleEndISO = isRecurring ? nextDue.toISOString() : nowISO;
+
+      // 4) Reutilizar factura pendiente (product_id O service_id)
+      let inv = db.prepare(`
+        SELECT * FROM invoices
+        WHERE user_id=? AND (product_id=? OR service_id=?) AND status IN ('pending','unpaid','overdue')
+        ORDER BY datetime(created_at) DESC, id DESC
+        LIMIT 1
+      `).get(u.id, p.id, svc.id);
+
+      if (inv) {
+        // Marcar como pagada por créditos y vincular al servicio
+        db.prepare(`
+          UPDATE invoices
+          SET status='paid',
+              payment_method='credits',
+              due_at=?,
+              paid_at=?,
+              cycle_end_at=?,
+              service_id=?,
+              external_id=NULL
+          WHERE id=?
+        `).run(nowISO, nowISO, cycleEndISO, svc.id, inv.id);
+      } else {
+        // Crear nueva factura pagada y vincular al servicio
+        const number = nextInvoiceNumber();
+        db.prepare(`
+          INSERT INTO invoices
+            (number,user_id,product_id,service_id,amount,currency,status,payment_method,external_id,created_at,due_at,paid_at,cycle_end_at)
+          VALUES (?,?,?,?,?,?,'paid','credits',NULL,?,?,?,?)
+        `).run(number, u.id, p.id, svc.id, p.price, cur, nowISO, nowISO, nowISO, cycleEndISO);
+        inv = db.prepare(`SELECT * FROM invoices WHERE number=?`).get(number);
+      }
+
+      // Limpiar otras pendientes del mismo producto/servicio (si hubiera)
+      const leftovers = db.prepare(`
+        SELECT id, external_id FROM invoices
+        WHERE user_id=? AND (product_id=? OR service_id=?) AND status IN ('pending','unpaid','overdue') AND id<>?
+      `).all(u.id, p.id, svc.id, inv.id);
+      leftovers.forEach(r => {
+        tryDeletePDF(r.external_id);
+        db.prepare(`DELETE FROM invoices WHERE id=?`).run(r.id);
+      });
+
+      return { invoiceId: inv.id, number: inv.number, createdAt: nowISO, cycleEnd: cycleEndISO };
+    })();
+
+    // Datos para PDF
+    const user = db.prepare(`SELECT id,username,name,surname,email,phone FROM users WHERE id=?`).get(u.id);
+    const site = get("site_name", "SkyShop");
+    const logo = get("logo_url", "");
+
+    try {
+      await createInvoicePDF({
+        number: result.number, site, logoUrl: logo, user, product: p,
+        amount: p.price, currency: cur, createdAt: result.createdAt, cycleEnd: result.cycleEnd,
+      });
+      const rel = `/uploads/invoices/${result.number}.pdf`;
+      db.prepare(`UPDATE invoices SET external_id=? WHERE id=?`).run(rel, result.invoiceId);
+    } catch (err) {
+      console.error("PDF error:", err);
     }
 
-    // Factura pagada por créditos
-    const nowISO = now.toISOString();
-    const cycleEndISO = nextDue.toISOString();
-    db.prepare(`
-      INSERT INTO invoices
-        (number,user_id,product_id,amount,currency,status,payment_method,external_id,created_at,due_at,paid_at,cycle_end_at)
-      VALUES (?,?,?,?,?,'paid','credits',NULL,?,?,?,?)
-    `).run(number, uSession.id, p.id, p.price, cur, nowISO, nowISO, nowISO, cycleEndISO);
-
-    const inv = db.prepare(`SELECT id FROM invoices WHERE number=?`).get(number);
-    return { invoiceId: inv.id, number, createdAt: nowISO, cycleEnd: cycleEndISO };
-  })();
-
-  // Datos para PDF
-  const user = db.prepare(`SELECT id,username,name,surname,email,phone FROM users WHERE id=?`).get(uSession.id);
-  const site = get("site_name", "SkyShop");
-  const logo = get("logo_url", "");
-
-  // Generar PDF
-  try {
-    await createInvoicePDF({
-      number: result.number, site, logoUrl: logo, user, product: p,
-      amount: p.price, currency: cur, createdAt: result.createdAt, cycleEnd: result.cycleEnd,
-    });
-    const rel = `/uploads/invoices/${result.number}.pdf`;
-    db.prepare(`UPDATE invoices SET external_id=? WHERE id=?`).run(rel, result.invoiceId);
-  } catch (err) {
-    console.error("PDF error:", err);
+    res.redirect(`/invoices/confirm/${result.invoiceId}`);
+  } catch (e) {
+    res.status(400).send(String(e?.message || "Error en el pago"));
   }
-
-  // Volvemos a la página de confirmación (vive en invoices.js)
-  res.redirect(`/invoices/confirm/${result.invoiceId}`);
 });
 
 /* ===== POST /product/paypal/start =====
-   Crea (o reutiliza) una factura PENDIENTE para el producto y la devuelve para PayPal. */
+   Crea (o reutiliza) una factura PENDIENTE para el producto.
+   NOTA: No descuenta stock aquí; debe descontarse al marcar la factura como 'paid'
+   en tus controladores de PayPal API/IPN (para evitar reservas que no se pagan). */
 router.post(
   "/product/paypal/start",
   ensureAuth,
@@ -501,6 +607,17 @@ router.post(
 
       const p = db.prepare(`SELECT * FROM products WHERE id=? AND active=1`).get(pid);
       if (!p) return res.json({ ok: false, error: "Producto no encontrado" });
+
+      const isOneTime = String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0;
+      const userHasActive = !!db.prepare(`SELECT 1 FROM services WHERE user_id=? AND product_id=? AND status='active'`).get(u.id, p.id);
+      if (isOneTime && userHasActive) {
+        return res.json({ ok: false, error: "Este producto de pago único ya fue adquirido." });
+      }
+
+      const outOfStock = (typeof p.stock === "number") && p.stock === 0;
+      if (outOfStock) {
+        return res.json({ ok: false, error: "Sin stock." });
+      }
 
       // Reutiliza la última PENDIENTE; si no, crea una con "number"
       let inv = db.prepare(`
