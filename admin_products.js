@@ -1,4 +1,4 @@
-// admin_products.js — Admin: lista, creación/edición y eliminación de productos
+// admin_products.js — Admin: lista, creación/edición y eliminación de productos (pago único + stock)
 "use strict";
 
 const fs = require("fs");
@@ -26,7 +26,7 @@ function ensureAdmin(req,res,next){
 }
 
 function ensureSchema(){
-  // products (con period_minutes, reveal_info y created_at)
+  // products
   db.prepare(`CREATE TABLE IF NOT EXISTS products(
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -35,7 +35,9 @@ function ensureSchema(){
     price REAL NOT NULL,
     currency TEXT NOT NULL CHECK(currency IN ('USD','MXN')),
     image_path TEXT DEFAULT '',
-    period_minutes INTEGER NOT NULL DEFAULT 43200, -- 30 días
+    period_minutes INTEGER NOT NULL DEFAULT 43200, -- 30 días (0 = único)
+    billing_type TEXT NOT NULL DEFAULT 'recurring' CHECK(billing_type IN ('recurring','one_time')),
+    stock INTEGER NOT NULL DEFAULT -1,            -- -1 = ilimitado, 0 = sin stock
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
   )`).run();
@@ -44,38 +46,38 @@ function ensureSchema(){
   try{ db.prepare(`ALTER TABLE products ADD COLUMN reveal_info TEXT DEFAULT ''`).run(); }catch{}
   try{ db.prepare(`ALTER TABLE products ADD COLUMN period_minutes INTEGER NOT NULL DEFAULT 43200`).run(); }catch{}
   try{ db.prepare(`ALTER TABLE products ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'))`).run(); }catch{}
-
-  // services (para renovaciones)
-  db.prepare(`CREATE TABLE IF NOT EXISTS services(
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    product_id INTEGER NOT NULL,
-    period_minutes INTEGER NOT NULL,
-    next_invoice_at TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    UNIQUE(user_id, product_id),
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-  )`).run();
+  try{ db.prepare(`ALTER TABLE products ADD COLUMN billing_type TEXT NOT NULL DEFAULT 'recurring'`).run(); }catch{}
+  try{ db.prepare(`UPDATE products SET billing_type='recurring' WHERE billing_type IS NULL OR billing_type=''`).run(); }catch{}
+  try{ db.prepare(`ALTER TABLE products ADD COLUMN stock INTEGER NOT NULL DEFAULT -1`).run(); }catch{}
 }
 ensureSchema();
 
 /* ========= UI: lista ========= */
-/* Este router se monta en /admin/products (index.js: app.use("/admin/products", require("./admin_products")) ) */
 router.get("/", ensureAdmin, (req,res)=>{
   const site = db.getSetting("site_name","SkyShop");
-  const rows = db.prepare(`SELECT id,name,price,currency,active FROM products ORDER BY id DESC LIMIT 200`).all();
-  const items = rows.map(p=>`
+  const rows = db.prepare(`
+    SELECT id,name,price,currency,active,billing_type,stock
+    FROM products
+    ORDER BY id DESC LIMIT 200
+  `).all();
+
+  const items = rows.map(p=>{
+    const stockTxt = (p.stock < 0) ? "∞" : String(p.stock);
+    const stockClass = (p.stock === 0) ? "out" : (p.stock < 0 ? "inf" : "ok");
+    return `
     <tr data-id="${p.id}">
       <td>${p.id}</td>
       <td>${p.name}</td>
       <td>${p.currency} ${Number(p.price).toFixed(2)}</td>
+      <td><span class="tag ${p.billing_type==='one_time'?'one':'rec'}">${p.billing_type==='one_time'?'Único':'Recurrente'}</span></td>
+      <td><span class="tag ${stockClass}">${stockTxt}</span></td>
       <td><span class="tag ${p.active? 'ok':'mut'}">${p.active? 'Activo' : 'Oculto'}</span></td>
       <td class="right">
         <a class="btn blue" href="/admin/products/new?id=${p.id}">Editar</a>
         <button class="btn red" data-del="${p.id}">Eliminar</button>
       </td>
-    </tr>`).join("") || `<tr><td colspan="5" class="muted">Sin productos.</td></tr>`;
+    </tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">Sin productos.</td></tr>`;
 
   res.type("html").send(`<!doctype html>
 <html lang="es">
@@ -91,17 +93,6 @@ router.get("/", ensureAdmin, (req,res)=>{
   body.light{background:#ffffff;color:#0b1220}
   body.light .card{background:#fff;border-color:#00000018}
   body.light .muted{color:#667085}
-
-  .sky{position:fixed;inset:0;pointer-events:none;z-index:0}
-  .star{position:absolute;width:2px;height:2px;background:#fff;border-radius:50%;opacity:.9;animation:twinkle 3s linear infinite}
-  .shoot{position:absolute;width:140px;height:2px;background:linear-gradient(90deg,#fff,transparent);transform:rotate(18deg);filter:drop-shadow(0 0 6px #ffffff55);animation:shoot 5.5s linear infinite}
-  @keyframes twinkle{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}
-  @keyframes shoot{0%{transform:translate(-10vw,-10vh) rotate(18deg)}100%{transform:translate(110vw,110vh) rotate(18deg)}}
-
-  .icons{position:fixed;inset:0;z-index:0;pointer-events:none;display:none}
-  body.light .icons{display:block}
-  .icons span{position:absolute;font-size:34px;opacity:.24;animation:floatUp linear infinite}
-  @keyframes floatUp{0%{transform:translateY(20vh);opacity:0}10%{opacity:.24}90%{opacity:.24}100%{transform:translateY(-30vh);opacity:0}}
 
   .wrap{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:18px}
   .top{display:flex;align-items:center;gap:10px;justify-content:space-between;margin-bottom:10px}
@@ -120,15 +111,16 @@ router.get("/", ensureAdmin, (req,res)=>{
   .tag{display:inline-block;padding:4px 8px;border-radius:999px;border:1px solid var(--line);font-size:12px}
   .tag.ok{background:#16a34a22;border-color:#16a34a55}
   .tag.mut{background:#9aa4b222;border-color:#9aa4b255}
-  @media(max-width:720px){
+  .tag.one{background:#f59e0b22;border-color:#f59e0b55}
+  .tag.rec{background:#2563eb22;border-color:#2563eb55}
+  .tag.inf{background:#64748b22;border-color:#64748b55}
+  .tag.out{background:#ef444422;border-color:#ef444455}
+  @media(max-width:920px){
     .title{flex-direction:column;align-items:stretch}
     .right{justify-content:flex-start}
   }
 </style>
 <body>
-  <div class="sky" id="sky"></div>
-  <div class="icons" id="icons"></div>
-
   <main class="wrap">
     <div class="top">
       <a class="pill" href="/admin">← Volver a Admin</a>
@@ -144,59 +136,23 @@ router.get("/", ensureAdmin, (req,res)=>{
         <div class="muted">Crea, edita o elimina productos.</div>
       </div>
       <table>
-        <thead><tr><th>ID</th><th>Nombre</th><th>Precio</th><th>Estado</th><th class="right">Acciones</th></tr></thead>
+        <thead>
+          <tr>
+            <th>ID</th><th>Nombre</th><th>Precio</th><th>Tipo</th><th>Stock</th><th>Estado</th><th class="right">Acciones</th>
+          </tr>
+        </thead>
         <tbody id="tbody">${items}</tbody>
       </table>
     </section>
   </main>
 
 <script>
-  // Estrellas (oscuro)
-  (function(){
-    const sky = document.getElementById('sky');
-    for(let i=0;i<90;i++){
-      const s=document.createElement('div');
-      s.className='star';
-      s.style.top=(Math.random()*100).toFixed(2)+'%';
-      s.style.left=(Math.random()*100).toFixed(2)+'%';
-      s.style.opacity=(0.35+Math.random()*0.65).toFixed(2);
-      s.style.transform='scale('+(0.6+Math.random()*1.6).toFixed(2)+')';
-      s.style.animationDelay=(Math.random()*3).toFixed(2)+'s';
-      sky.appendChild(s);
-    }
-    for(let i=0;i<3;i++){
-      const sh=document.createElement('div');
-      sh.className='shoot';
-      sh.style.top=(Math.random()*25).toFixed(2)+'%';
-      sh.style.left=(Math.random()*60).toFixed(2)+'%';
-      sh.style.animationDelay=(1+Math.random()*5).toFixed(2)+'s';
-      sky.appendChild(sh);
-    }
-  })();
-
-  // Emojis (claro)
-  (function(){
-    const icons=document.getElementById('icons');
-    const set=['🎵','🎬','🎮','📷','🎧','📱','💾','🛒','📺','📀','💡','🚀'];
-    for(let i=0;i<26;i++){
-      const sp=document.createElement('span');
-      sp.textContent=set[i%set.length];
-      sp.style.left=(Math.random()*100).toFixed(2)+'%';
-      sp.style.top=(Math.random()*100).toFixed(2)+'%';
-      sp.style.animationDuration=(20+Math.random()*18).toFixed(1)+'s';
-      sp.style.animationDelay=(Math.random()*8).toFixed(1)+'s';
-      icons.appendChild(sp);
-    }
-  })();
-
   // Tema
   (function(){
     const btn=document.getElementById('modeBtn');
     function apply(mode){
       const light=(mode==='light');
       document.body.classList.toggle('light', light);
-      document.getElementById('sky').style.display = light ? 'none' : 'block';
-      document.getElementById('icons').style.display = light ? 'block' : 'none';
       btn.textContent = light ? '☀️' : '🌙';
       localStorage.setItem('ui:mode', light?'light':'dark');
     }
@@ -235,10 +191,12 @@ router.get("/new", ensureAdmin, (req,res)=>{
   const site = db.getSetting("site_name","SkyShop");
   const id = Number(req.query.id||0);
   let p = id ? db.prepare(`SELECT * FROM products WHERE id=?`).get(id) : null;
-  if (!p) p = { id:0, name:"", description:"", reveal_info:"", price:"", currency:"USD", image_path:"", period_minutes:43200, active:1 };
-
-  const sel = v => (p.currency===v ? "selected" : "");
-  const selPeriod = m => (p.period_minutes==m ? "selected":"");
+  if (!p) p = {
+    id:0, name:"", description:"", reveal_info:"",
+    price:"", currency:"USD", image_path:"",
+    period_minutes:43200, billing_type:"recurring",
+    stock:-1, active:1
+  };
 
   res.type("html").send(`<!doctype html>
 <html lang="es">
@@ -252,18 +210,6 @@ router.get("/new", ensureAdmin, (req,res)=>{
   body.light{background:#ffffff;color:#0b1220}
   body.light .card{background:#fff;border-color:#00000018}
   body.light .muted{color:#667085}
-
-  .sky{position:fixed;inset:0;pointer-events:none;z-index:0}
-  .star{position:absolute;width:2px;height:2px;background:#fff;border-radius:50%;opacity:.9;animation:twinkle 3s linear infinite}
-  .shoot{position:absolute;width:140px;height:2px;background:linear-gradient(90deg,#fff,transparent);transform:rotate(18deg);filter:drop-shadow(0 0 6px #ffffff55);animation:shoot 5.5s linear infinite}
-  @keyframes twinkle{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}
-  @keyframes shoot{0%{transform:translate(-10vw,-10vh) rotate(18deg)}100%{transform:translate(110vw,110vh) rotate(18deg)}}
-
-  .icons{position:fixed;inset:0;z-index:0;pointer-events:none;display:none}
-  body.light .icons{display:block}
-  .icons span{position:absolute;font-size:34px;opacity:.24;animation:floatUp linear infinite}
-  @keyframes floatUp{0%{transform:translateY(20vh);opacity:0}10%{opacity:.24}90%{opacity:.24}100%{transform:translateY(-30vh);opacity:0}}
-
   .wrap{position:relative;z-index:1;max-width:900px;margin:0 auto;padding:18px}
   .top{display:flex;align-items:center;gap:10px;justify-content:space-between;margin-bottom:10px}
   .pill{padding:8px 10px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff28;color:inherit;text-decoration:none}
@@ -278,12 +224,10 @@ router.get("/new", ensureAdmin, (req,res)=>{
   .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
   .muted{color:var(--muted)}
   .preview{width:260px;aspect-ratio:1;object-fit:cover;border-radius:10px;border:1px solid #ffffff22;background:#0f172a}
+  .hint{font-size:12px;opacity:.85}
   @media(max-width:760px){ .grid{grid-template-columns:1fr} .preview{width:100%} }
 </style>
 <body>
-  <div class="sky" id="sky"></div>
-  <div class="icons" id="icons"></div>
-
   <main class="wrap">
     <div class="top">
       <a class="pill" href="/admin/products">← Volver a Productos</a>
@@ -310,9 +254,10 @@ router.get("/new", ensureAdmin, (req,res)=>{
               <option value="0" ${!p.active? "selected":""}>Oculto</option>
             </select>
           </div>
+
           <div>
             <label>Precio</label>
-            <input class="input" name="price" type="number" step="0.01" required value="${p.price}">
+            <input class="input" name="price" type="number" step="0.01" min="0.01" required value="${p.price}">
           </div>
           <div>
             <label>Moneda</label>
@@ -321,19 +266,36 @@ router.get("/new", ensureAdmin, (req,res)=>{
               <option ${p.currency==='MXN'?'selected':''} value="MXN">MXN</option>
             </select>
           </div>
+
           <div>
+            <label>Tipo de cobro</label>
+            <select class="input" id="billing_type" name="billing_type">
+              <option value="recurring" ${p.billing_type==='recurring'?'selected':''}>Recurrente (se renueva)</option>
+              <option value="one_time"  ${p.billing_type==='one_time'?'selected':''}>Único (no se renueva)</option>
+            </select>
+            <div class="hint muted" id="bt_hint"></div>
+          </div>
+
+          <div id="period_wrap">
             <label>Periodo de facturación</label>
-            <select class="input" name="period_minutes" required>
+            <select class="input" id="period_minutes" name="period_minutes" required>
               <option ${p.period_minutes==3?'selected':''} value="3">TEST · 3 minutos</option>
               <option ${p.period_minutes==10080?'selected':''} value="10080">Semanal (1 semana)</option>
               <option ${p.period_minutes==21600?'selected':''} value="21600">15 días</option>
               <option ${p.period_minutes==43200?'selected':''} value="43200">Mensual (30 días)</option>
             </select>
           </div>
+
+          <div>
+            <label>Stock</label>
+            <input class="input" name="stock" type="number" step="1" min="-1" value="${Number.isFinite(p.stock)?p.stock:-1}">
+            <div class="hint muted">-1 = ilimitado · 0 = sin stock · >0 = unidades disponibles</div>
+          </div>
+
           <div>
             <label>Imagen (sube archivo)</label>
             <input class="input" id="file" type="file" accept="image/*">
-            <div class="muted">Se guardará como PNG. Actual: ${p.image_path || "—"}</div>
+            <div class="muted">Se guardará como PNG (máx. ${MAX_IMAGE_MB}MB). Actual: ${p.image_path || "—"}</div>
           </div>
         </div>
 
@@ -360,46 +322,12 @@ router.get("/new", ensureAdmin, (req,res)=>{
   </main>
 
 <script>
-  // Animaciones (igual que antes)
-  (function(){
-    const sky=document.getElementById('sky');
-    for(let i=0;i<90;i++){
-      const s=document.createElement('div'); s.className='star';
-      s.style.top=(Math.random()*100).toFixed(2)+'%';
-      s.style.left=(Math.random()*100).toFixed(2)+'%';
-      s.style.opacity=(0.35+Math.random()*0.65).toFixed(2);
-      s.style.transform='scale('+(0.6+Math.random()*1.6).toFixed(2)+')';
-      s.style.animationDelay=(Math.random()*3).toFixed(2)+'s';
-      sky.appendChild(s);
-    }
-    for(let i=0;i<3;i++){
-      const sh=document.createElement('div'); sh.className='shoot';
-      sh.style.top=(Math.random()*25).toFixed(2)+'%';
-      sh.style.left=(Math.random()*60).toFixed(2)+'%';
-      sh.style.animationDelay=(1+Math.random()*5).toFixed(2)+'s';
-      sky.appendChild(sh);
-    }
-    const icons=document.getElementById('icons');
-    const set=['🎵','🎬','🎮','📷','🎧','📱','💾','🛒','📺','📀','💡','🚀'];
-    for(let i=0;i<26;i++){
-      const sp=document.createElement('span');
-      sp.textContent=set[i%set.length];
-      sp.style.left=(Math.random()*100).toFixed(2)+'%';
-      sp.style.top=(Math.random()*100).toFixed(2)+'%';
-      sp.style.animationDuration=(20+Math.random()*18).toFixed(1)+'s';
-      sp.style.animationDelay=(Math.random()*8).toFixed(1)+'s';
-      icons.appendChild(sp);
-    }
-  })();
-
   // Tema
   (function(){
     const btn=document.getElementById('modeBtn');
     function apply(mode){
       const light=(mode==='light');
       document.body.classList.toggle('light', light);
-      document.getElementById('sky').style.display = light ? 'none' : 'block';
-      document.getElementById('icons').style.display = light ? 'block' : 'none';
       btn.textContent = light ? '☀️' : '🌙';
       localStorage.setItem('ui:mode', light?'light':'dark');
     }
@@ -418,6 +346,33 @@ router.get("/new", ensureAdmin, (req,res)=>{
       r.onload = ()=>{ out.value = String(r.result||''); prev.src = out.value; };
       r.readAsDataURL(f);
     });
+  })();
+
+  // Mostrar/ocultar periodo según tipo
+  (function(){
+    const typeSel = document.getElementById('billing_type');
+    const wrap    = document.getElementById('period_wrap');
+    const hint    = document.getElementById('bt_hint');
+    const pmSel   = document.getElementById('period_minutes');
+
+    function apply(){
+      const one = typeSel.value === 'one_time';
+      wrap.style.display = one ? 'none' : 'block';
+      pmSel.disabled = one;
+      hint.textContent = one
+        ? 'Este producto se paga una sola vez. No se generarán renovaciones.'
+        : 'Este producto generará facturas automáticamente según el período.';
+      if (one) {
+        const opt = document.createElement('option');
+        opt.value = '0'; opt.selected = true; opt.hidden = true;
+        pmSel.appendChild(opt);
+      }else{
+        const zero = [...pmSel.options].find(o=>o.value==='0');
+        if (zero) zero.remove();
+      }
+    }
+    apply();
+    typeSel.addEventListener('change', apply);
   })();
 
   // Eliminar desde la pantalla de edición
@@ -451,7 +406,11 @@ router.post("/new", ensureAdmin, parseLarge, (req,res)=>{
   const reveal_info = String(req.body?.reveal_info||"").trim();
   const price = Number(req.body?.price||0);
   const currency = String(req.body?.currency||"USD").toUpperCase()==="MXN" ? "MXN" : "USD";
-  const period_minutes = Math.max(3, parseInt(req.body?.period_minutes||43200,10));
+  const billing_type = (String(req.body?.billing_type||"recurring")==="one_time") ? "one_time" : "recurring";
+  const input_period = parseInt(req.body?.period_minutes||43200,10);
+  const period_minutes = billing_type === "one_time" ? 0 : Math.max(3, input_period);
+  const stockRaw = parseInt(req.body?.stock ?? "-1", 10);
+  const stock = Number.isFinite(stockRaw) ? Math.max(-1, stockRaw) : -1; // -1 ilimitado
   const active = Number(req.body?.active||1) ? 1 : 0;
   const b64 = String(req.body?.image_b64||"");
   const now = new Date().toISOString();
@@ -460,14 +419,14 @@ router.post("/new", ensureAdmin, parseLarge, (req,res)=>{
 
   if (id){
     db.prepare(`UPDATE products
-                SET name=?,description=?,reveal_info=?,price=?,currency=?,period_minutes=?,active=?
+                SET name=?,description=?,reveal_info=?,price=?,currency=?,period_minutes=?,billing_type=?,stock=?,active=?
                 WHERE id=?`)
-      .run(name, description, reveal_info, price, currency, period_minutes, active, id);
+      .run(name, description, reveal_info, price, currency, period_minutes, billing_type, stock, active, id);
   }else{
     db.prepare(`INSERT INTO products
-                (name,description,reveal_info,price,currency,period_minutes,active,created_at)
-                VALUES(?,?,?,?,?,?,?,?)`)
-      .run(name, description, reveal_info, price, currency, period_minutes, active, now);
+                (name,description,reveal_info,price,currency,period_minutes,billing_type,stock,active,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)`)
+      .run(name, description, reveal_info, price, currency, period_minutes, billing_type, stock, active, now);
   }
   const pid = id || db.prepare(`SELECT last_insert_rowid() AS id`).get().id;
 
