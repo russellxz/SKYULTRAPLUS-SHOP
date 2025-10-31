@@ -83,7 +83,8 @@ router.get('/register', ensureGuest, (req,res)=>{
     e==='3' ? 'El correo ya está registrado' :
     e==='4' ? 'El nombre de usuario ya existe' :
     e==='5' ? 'Usuario inválido (usa 3-20 letras/números/_)' :
-    e==='6' ? 'Teléfono inválido' : '';
+    e==='6' ? 'WhatsApp inválido' :
+    e==='7' ? 'Debes aceptar los Términos del Servicio' : '';
 
   const opts = COUNTRIES.map(x =>
     `<option value="${x.d}" ${x.c==='MX'?'selected':''}>${x.n} (${x.d})</option>`
@@ -93,7 +94,7 @@ router.get('/register', ensureGuest, (req,res)=>{
 <html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${site} · Registro</title>
 <style>
-  :root{ --card:#111827; --txt:#e5e7eb; --muted:#9aa4b2; --accent:#f43f5e; --accent2:#fb7185; --r:16px; }
+  :root{ --card:#111827; --txt:#e5e7eb; --muted:#9aa4b2; --accent:#f43f5e; --accent2:#fb7185; --r:16px; --blue:#1d4ed8; }
   *{box-sizing:border-box}
   body{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; background:#0b1220; color:var(--txt); min-height:100vh; overflow-x:hidden; }
 
@@ -106,10 +107,7 @@ router.get('/register', ensureGuest, (req,res)=>{
   body.light{ background:#ffffff; color:#0b1220; }
   .icons{ position:fixed; inset:0; z-index:0; pointer-events:none; display:none; }
   body.light .icons{ display:block; }
-  .icons span{
-    position:absolute; font-size:34px; opacity:.32; filter:saturate(120%) drop-shadow(0 0 1px #00000010);
-    animation: floatUp linear infinite;
-  }
+  .icons span{ position:absolute; font-size:34px; opacity:.32; filter:saturate(120%) drop-shadow(0 0 1px #00000010); animation: floatUp linear infinite; }
   @media(min-width:900px){ .icons span{ font-size:40px; } }
   @keyframes floatUp{ 0%{ transform:translateY(20vh); opacity:.0 } 10%{opacity:.32} 90%{opacity:.32} 100%{ transform:translateY(-30vh); opacity:.0 } }
 
@@ -125,14 +123,12 @@ router.get('/register', ensureGuest, (req,res)=>{
   .brand-name{
     font-weight:900; font-size:17px; letter-spacing:.2px; display:inline-block;
     background-image:linear-gradient(90deg,#ffffff,#ef4444);
-    background-clip:text; -webkit-background-clip:text;
-    color:transparent; -webkit-text-fill-color:transparent;
+    background-clip:text; -webkit-background-clip:text; color:transparent; -webkit-text-fill-color:transparent;
   }
   body.light .brand-pill{ background:#0000000a; border-color:#00000012; }
   body.light .brand-name{
     background-image:linear-gradient(90deg,#000000,#ef4444);
-    background-clip:text; -webkit-background-clip:text;
-    color:transparent; -webkit-text-fill-color:transparent;
+    background-clip:text; -webkit-background-clip:text; color:transparent; -webkit-text-fill-color:transparent;
   }
 
   /* botones */
@@ -150,6 +146,14 @@ router.get('/register', ensureGuest, (req,res)=>{
   body.light .input{ background:#ffffff; color:#0b1220; border-color:#00000022 }
   .row{ display:flex; gap:8px; align-items:center; }
   .btn{ display:inline-block; background:linear-gradient(90deg,var(--accent),var(--accent2)); color:#fff; border:none; padding:12px 14px; border-radius:12px; cursor:pointer; width:100%; font-weight:800; }
+
+  /* checkbox TOS estilo cuadrado azul */
+  .tosrow{ margin:10px 0 0; gap:12px; align-items:flex-start; }
+  .ck{ appearance:none; -webkit-appearance:none; width:22px; height:22px; border:2px solid var(--blue); border-radius:6px; background:transparent; display:inline-grid; place-content:center; cursor:pointer; flex:0 0 22px; }
+  .ck:checked::after{ content:""; width:12px; height:12px; background:var(--blue); border-radius:3px; }
+  .toslabel{ line-height:1.35; user-select:none; }
+  .toslabel .toslink{ color:#60a5fa; text-decoration:none; font-weight:800; }
+  .toslabel .toslink:hover{ text-decoration:underline; }
 
   .err{ color:#ff6b7f; margin-bottom:8px; font-weight:600 }
   .foot{ margin-top:12px; display:flex; justify-content:space-between }
@@ -171,7 +175,7 @@ router.get('/register', ensureGuest, (req,res)=>{
   <main class="wrap">
     <section class="card">
       <h1>Crear cuenta</h1>
-      <div class="muted">Completa el formulario para registrarte.</div>
+      <div class="muted">Completa el formulario para registrarte. Usaremos tu <b>WhatsApp</b> para avisarte de compras y facturas (pagadas y pendientes).</div>
       ${err ? `<div class="err">${err}</div>` : ``}
       <form method="post" action="/register">
         <div class="grid">
@@ -185,7 +189,7 @@ router.get('/register', ensureGuest, (req,res)=>{
         <div class="grid">
           <div class="row" style="gap:8px">
             <select name="cc" class="input" style="max-width:170px">${opts}</select>
-            <input class="input" name="phone" placeholder="Número de teléfono" required>
+            <input class="input" name="phone" placeholder="Número de WhatsApp (solo dígitos)" required>
           </div>
           <div></div>
         </div>
@@ -199,7 +203,16 @@ router.get('/register', ensureGuest, (req,res)=>{
             <button type="button" class="eyebtn" id="toggle2">👁</button>
           </div>
         </div>
-        <button class="btn" type="submit" style="margin-top:8px">Crear cuenta</button>
+
+        <!-- Aceptación de TOS -->
+        <div class="row tosrow">
+          <input id="tos" class="ck" type="checkbox" name="tos" required>
+          <label class="toslabel" for="tos">
+            Estoy de acuerdo con los <a href="/terminos" target="_blank" class="toslink">Términos del Servicio</a>
+          </label>
+        </div>
+
+        <button class="btn" type="submit" style="margin-top:12px">Crear cuenta</button>
       </form>
       <div class="foot">
         <span></span><a class="link" href="/login">¿Ya tienes cuenta? Inicia sesión</a>
@@ -265,7 +278,7 @@ router.get('/register', ensureGuest, (req,res)=>{
 
 /* ===== POST /register ===== */
 router.post("/register", ensureGuest, async (req, res) => {
-  let { name, surname, username, email, cc, phone, password, confirm } = req.body;
+  let { name, surname, username, email, cc, phone, password, confirm, tos } = req.body;
   name = (name||"").trim(); surname=(surname||"").trim();
   username=(username||"").trim(); email=(email||"").trim().toLowerCase();
   cc=(cc||"").trim(); phone=(phone||"").trim();
@@ -273,6 +286,7 @@ router.post("/register", ensureGuest, async (req, res) => {
   if(!name||!surname||!username||!email||!cc||!phone||!password||!confirm){
     return res.redirect("/register?e=1");
   }
+  if(tos !== 'on') return res.redirect("/register?e=7"); // Debe aceptar TOS
   if(!/^[A-Za-z0-9_]{3,20}$/.test(username)) return res.redirect("/register?e=5");
   if(password !== confirm) return res.redirect("/register?e=2");
   if(!/^\+\d{1,4}$/.test(cc) || !/^\d{5,20}$/.test(phone.replace(/\D/g,""))) return res.redirect("/register?e=6");
