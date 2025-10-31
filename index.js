@@ -48,9 +48,12 @@ app.set("trust proxy", 1);
 app.use("/public", express.static(path.join(__dirname, "public")));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-/* ===== Parsers (límites altos) ===== */
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ extended: true, limit: "50mb", parameterLimit: 100000 }));
+/* ===== Parsers globales (con EXCEPCIÓN para /pay/stripe/webhook) ===== */
+const jsonParser = express.json({ limit: "50mb" });
+const urlParser  = express.urlencoded({ extended: true, limit: "50mb", parameterLimit: 100000 });
+function isStripeWebhook(req){ return req.originalUrl === "/pay/stripe/webhook"; }
+app.use((req,res,next)=> isStripeWebhook(req) ? next() : jsonParser(req,res,next));
+app.use((req,res,next)=> isStripeWebhook(req) ? next() : urlParser(req,res,next));
 app.use(cookie());
 
 /* ===== Auto-descubrir y guardar la URL pública ===== */
@@ -102,7 +105,15 @@ app.use("/", require("./forgot"));           // /forgot
 app.use("/", require("./reset"));            // /reset
 app.use("/", require("./dashboard"));        // "/" y /dashboard
 app.use("/", require("./product"));          // /product y /product/buy
-app.use("/pay", require("./pay"));           // /pay/paypal y /pay/stripe
+
+/* ===== Pagos =====
+   - Stripe bajo /pay (su webhook usa raw body, por eso la excepción arriba).
+   - PayPal se monta en "/" para que rutas absolutas como /pay/paypal/api/create EXISTAN.
+*/
+app.use("/pay", require("./pay_stripe"));    // Stripe (incluye /pay/stripe y /pay/stripe/webhook)
+app.use("/",    require("./pay_paypal"));    // PayPal (mantiene /pay/paypal/* tal cual)
+
+/* ===== Facturas / Servicios / Perfil / Créditos ===== */
 app.use("/invoices", require("./invoices")); // facturas
 app.use("/", require("./services"));
 app.use("/profile", require("./profile"));
@@ -115,12 +126,11 @@ app.use("/admin", require("./admin"));
 app.use("/admin", require("./admin_brand"));
 app.use("/admin/invoices", require("./admin_invoices"));
 app.use("/admin/paypal", require("./admin_paypal"));
-app.use("/pay", require("./pay_paypal"));
-app.use(require("./pay_paypal"));
 app.use("/admin", require("./admin_store"));
 app.use("/admin", require("./admin_user_edit"));
 app.use("/tickets", require("./tickets"));
 app.use("/admin", require("./admin_tickets"));
+app.use("/admin", require("./admin_stripe"));
 
 /* Panel de WhatsApp */
 app.use("/", require("./admin_whatsapp"));
