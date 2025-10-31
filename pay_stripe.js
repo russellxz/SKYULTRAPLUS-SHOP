@@ -5,6 +5,12 @@ const express = require("express");
 const db = require("./db");
 const router = express.Router();
 
+/* ——— PRAGMA: aseguramos FKs ——— */
+try {
+  if (typeof db.pragma === "function") db.pragma("foreign_keys = ON");
+  else if (typeof db.exec === "function") db.exec("PRAGMA foreign_keys = ON;");
+} catch { /* ignore */ }
+
 const getS = (k, d = "") => {
   try { return db.getSetting ? db.getSetting(k, d) : (db.prepare(`SELECT value FROM settings WHERE key=?`).get(k)?.value ?? d); }
   catch { return d; }
@@ -79,6 +85,10 @@ router.get("/stripe", ensureAuth, async (req, res) => {
   const pid = Number(req.query.pid || 0);
   if (!pid) return res.status(400).type("text/plain").send("Producto inválido");
 
+  // Prechequeos sólidos para evitar errores de FK
+  const userRow = db.prepare(`SELECT id FROM users WHERE id=?`).get(u.id);
+  if (!userRow) return res.status(400).type("text/plain").send("Usuario inválido (no existe).");
+
   const p = db.prepare(`SELECT * FROM products WHERE id=? AND active=1`).get(pid);
   if (!p) return res.status(404).type("text/plain").send("Producto no encontrado");
 
@@ -86,10 +96,7 @@ router.get("/stripe", ensureAuth, async (req, res) => {
   const isOneTime  = String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0;
   const isRecurring= !isOneTime;
 
-  // Bloqueos de recompra (igual que product.js):
-  // - single + one_time: bloquea si ya tiene activo
-  // - shared + one_time: PERMITE múltiples compras
-  // - cualquier recurrente: bloquea si ya tiene activo
+  // Bloqueos de recompra:
   if ((!isShared && isOneTime) || isRecurring){
     const hasActive = !!db.prepare(`SELECT 1 FROM services WHERE user_id=? AND product_id=? AND status='active'`)
       .get(u.id, p.id);
@@ -161,11 +168,27 @@ router.get("/stripe", ensureAuth, async (req, res) => {
       return `INV-${ym}-${String(seq).padStart(4,"0")}`;
     })();
     const nowISO = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO invoices(number,user_id,product_id,amount,currency,status,created_at)
-      VALUES(?,?,?,?,?,'pending',?)
-    `).run(number, u.id, p.id, price, currency, nowISO);
-    inv = db.prepare(`SELECT * FROM invoices WHERE number=?`).get(number);
+
+    try {
+      // IMPORTANTE: insertar service_id como NULL explícito para esquemas con FK estricta
+      db.prepare(`
+        INSERT INTO invoices(number,user_id,product_id,service_id,amount,currency,status,created_at)
+        VALUES(?,?,?,?,?,?,'pending',?)
+      `).run(number, u.id, p.id, null, price, currency, nowISO);
+
+      inv = db.prepare(`SELECT * FROM invoices WHERE number=?`).get(number);
+    } catch (e) {
+      console.error("[stripe] crear factura error:", e?.message || e);
+      const msg = /FOREIGN KEY/i.test(String(e?.message||""))
+        ? "No se pudo crear la factura por una referencia inválida (usuario/producto/servicio)."
+        : "No se pudo crear la factura.";
+      return res.status(400).type("html").send(`<!doctype html><meta charset="utf-8">
+        <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
+          <h2 style="margin:0 0 8px">Error al generar la factura</h2>
+          <p style="color:#ef4444"><b>${escapeHtml(msg)}</b></p>
+          <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
+        </div>`);
+    }
   }
   if (!inv) return res.status(500).type("text/plain").send("No se pudo generar la factura");
 
@@ -247,7 +270,8 @@ router.post("/stripe/webhook", express.raw({ type: "application/json" }), (req, 
       if (invoiceId){
         const inv = db.prepare(`SELECT * FROM invoices WHERE id=?`).get(invoiceId);
         const p = productId ? db.prepare(`SELECT * FROM products WHERE id=?`).get(productId) : null;
-        if (!inv || !p){ return res.status(200).send("OK"); }
+        const u = userId ? db.prepare(`SELECT id FROM users WHERE id=?`).get(userId) : null;
+        if (!inv || !p || !u){ return res.status(200).send("OK"); }
 
         const isShared   = String(p.delivery_mode || "single") === "shared";
         const isOneTime  = String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0;
@@ -266,9 +290,6 @@ router.post("/stripe/webhook", express.raw({ type: "application/json" }), (req, 
           }
 
           // 2) Crear/actualizar service:
-          //   - SINGLE + ÚNICO: sí crea service (bloquea recompra).
-          //   - SHARED + ÚNICO: NO crea service (permite recompras).
-          //   - Cualquier RECURRENTE: crea/actualiza service.
           let serviceId = null;
           if ((!isShared && isOneTime) || isRecurring){
             db.prepare(`
