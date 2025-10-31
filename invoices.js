@@ -9,65 +9,64 @@ const db = require("./db");
 
 const router = express.Router();
 
-/* ===== helpers ===== */
-function ensureAuth(req,res,next){
+/* ===================== helpers ===================== */
+function ensureAuth(req, res, next) {
   if (!req.session || !req.session.user) return res.redirect("/login");
   next();
 }
-function esc(s){ return String(s==null?'':s); }
-function fmtAmount(v,c){ const n=Number(v||0); return c==="USD"?`$ ${n.toFixed(2)}`:`MXN ${n.toFixed(2)}`; }
-function fmtDate(iso){ try{ return new Date(iso).toLocaleString(); }catch{ return iso||''; } }
-function baseUrl(req){
-  const proto = (req.headers["x-forwarded-proto"]||"").split(",")[0] || (req.secure?"https":"http");
+function esc(s) { return String(s == null ? "" : s); }
+function fmtDate(iso) { try { return new Date(iso).toLocaleString(); } catch { return iso || ""; } }
+function baseUrl(req) {
+  const proto = (req.headers["x-forwarded-proto"] || "").split(",")[0] || (req.secure ? "https" : "http");
   const host  = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
   return `${proto}://${host}`;
 }
 
 /* ==== util: siguiente número de factura (fallback) ==== */
 function nextInvoiceNumber() {
-  if (typeof db.nextInvoiceNumber === "function") {
-    return db.nextInvoiceNumber();
-  }
+  if (typeof db.nextInvoiceNumber === "function") return db.nextInvoiceNumber();
   const now = new Date();
-  const ym = now.toISOString().slice(0,7).replace("-","");
-  const seq = db.transaction(()=>{
+  const ym = now.toISOString().slice(0, 7).replace("-", "");
+  const seq = db.transaction(() => {
     db.prepare(`INSERT OR IGNORE INTO settings(key,value) VALUES('invoice_seq','0')`).run();
     db.prepare(`UPDATE settings SET value = CAST(value AS INTEGER) + 1 WHERE key='invoice_seq'`).run();
     const r = db.prepare(`SELECT value FROM settings WHERE key='invoice_seq'`).get();
-    return parseInt(r.value,10) || 1;
+    return parseInt(r.value, 10) || 1;
   })();
-  return `INV-${ym}-${String(seq).padStart(4,"0")}`;
+  return `INV-${ym}-${String(seq).padStart(4, "0")}`;
 }
 
-/* ==== util: PDF de factura ==== */
-async function createInvoicePDF(inv, user, product, site, logoUrl){
-  const number = inv.number || `INV-${inv.id}`;
+/* ==== util: PDF de factura (misma firma que product.js) ==== */
+async function createInvoicePDF({
+  number, site, logoUrl, user, product, amount, currency, createdAt, cycleEnd,
+}) {
   const dir = path.join(process.cwd(), "uploads", "invoices");
-  try { fs.mkdirSync(dir, { recursive:true }); } catch {}
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
   const outFile = path.join(dir, `${number}.pdf`);
 
-  const doc = new PDFDocument({ size:"A4", margin:36 });
+  const doc = new PDFDocument({ size: "A4", margin: 36 });
   const stream = fs.createWriteStream(outFile);
   doc.pipe(stream);
 
   // Encabezado
-  doc.rect(0,0,doc.page.width,90).fill("#0b1220");
-  try{
+  doc.rect(0, 0, doc.page.width, 90).fill("#0b1220");
+  try {
     if (logoUrl && /^\/uploads\//.test(logoUrl)) {
-      const absLogo = path.join(process.cwd(), logoUrl.replace(/^\//,""));
-      if (fs.existsSync(absLogo)) doc.image(absLogo, 36, 18, { height:54 });
+      const absLogo = path.join(process.cwd(), logoUrl.replace(/^\//, ""));
+      if (fs.existsSync(absLogo)) doc.image(absLogo, 36, 18, { height: 54 });
     }
-  }catch{}
-  doc.fillColor("#fff").fontSize(20).text(site, 0, 24, { align:"right" });
-  doc.fontSize(11).text(`Factura: ${number}`, 0, 48, { align:"right" });
-  doc.text(`Fecha: ${fmtDate(inv.created_at || inv.paid_at)}`, 0, 64, { align:"right" });
+  } catch {}
+  doc.fillColor("#ffffff").fontSize(20).text(site, 0, 24, { align: "right" });
+  doc.fontSize(11).text(`Factura: ${number}`, 0, 48, { align: "right" });
+  doc.text(`Fecha: ${fmtDate(createdAt)}`, 0, 64, { align: "right" });
 
-  const paid = (inv.status === "paid");
+  // Chip estado
   doc.save();
-  doc.roundedRect(36,100,120,24,8).fill(paid ? "#16a34a" : "#f59e0b");
-  doc.fillColor("#fff").fontSize(12).text(paid?"PAGADO":"PENDIENTE",36,104,{width:120,align:"center"});
+  doc.roundedRect(36, 100, 120, 24, 8).fill("#16a34a");
+  doc.fillColor("#fff").fontSize(12).text("PAGADO", 36, 104, { width: 120, align: "center" });
   doc.restore();
 
+  // Datos cliente
   doc.moveDown(2);
   doc.fillColor("#111827").fontSize(16).text("Cliente");
   doc.fillColor("#374151").fontSize(11);
@@ -76,34 +75,35 @@ async function createInvoicePDF(inv, user, product, site, logoUrl){
   doc.text(`Correo: ${user.email}`);
   doc.text(`Teléfono: ${user.phone || "—"}`);
 
+  // Detalle producto
   doc.moveDown(1);
   doc.fillColor("#111827").fontSize(16).text("Detalle");
   doc.fillColor("#374151").fontSize(11);
   doc.text(`Producto: ${product?.name || "—"}`);
   doc.text(`Descripción: ${product?.description || "—"}`);
-  if (inv.cycle_end_at) doc.text(`Próximo ciclo: ${fmtDate(inv.cycle_end_at)}`);
+  if (cycleEnd) doc.text(`Próximo ciclo: ${fmtDate(cycleEnd)}`);
 
+  // Resumen
   doc.moveDown(1);
   doc.fillColor("#111827").fontSize(16).text("Resumen");
   doc.fillColor("#0b1220").fontSize(13);
-  doc.text(`Total: ${inv.currency} ${Number(inv.amount).toFixed(2)}`);
+  doc.text(`Total: ${currency} ${Number(amount).toFixed(2)}`);
 
   doc.end();
-  await new Promise((res,rej)=>{ stream.on("finish",res); stream.on("error",rej); });
+  await new Promise((res, rej) => { stream.on("finish", res); stream.on("error", rej); });
 
   return `/uploads/invoices/${number}.pdf`;
 }
 
 /* ========== FULFILLMENT idempotente (activa servicio si está pagada) ========== */
 function fulfillPaidInvoice(invoiceId, userId) {
-  const inv = db
-    .prepare(
-      `SELECT i.*, p.name AS p_name, p.description AS p_desc, p.reveal_info, p.period_minutes, p.image_path
-       FROM invoices i
-       JOIN products p ON p.id = i.product_id
-       WHERE i.id = ? AND i.user_id = ?`
-    )
-    .get(invoiceId, userId);
+  const inv = db.prepare(`
+    SELECT i.*, p.name AS p_name, p.description AS p_desc, p.reveal_info,
+           p.period_minutes, p.image_path
+    FROM invoices i
+    JOIN products p ON p.id = i.product_id
+    WHERE i.id = ? AND i.user_id = ?
+  `).get(invoiceId, userId);
 
   if (!inv) return { ok: false, error: "Factura no encontrada" };
 
@@ -117,27 +117,28 @@ function fulfillPaidInvoice(invoiceId, userId) {
     new Date(paidAt.getTime() + (inv.period_minutes || 43200) * 60 * 1000).toISOString();
 
   db.transaction(() => {
-    const exist = db
-      .prepare(`SELECT * FROM services WHERE user_id=? AND product_id=?`)
-      .get(userId, inv.product_id);
+    const exist = db.prepare(
+      `SELECT * FROM services WHERE user_id=? AND product_id=?`
+    ).get(userId, inv.product_id);
+
     if (!exist) {
-      db.prepare(
-        `INSERT INTO services(user_id,product_id,period_minutes,next_invoice_at,status)
-         VALUES(?,?,?,?, 'active')`
-      ).run(userId, inv.product_id, inv.period_minutes, cycleEnd);
+      db.prepare(`
+        INSERT INTO services(user_id,product_id,period_minutes,next_invoice_at,status)
+        VALUES(?,?,?,?, 'active')
+      `).run(userId, inv.product_id, inv.period_minutes, cycleEnd);
     } else {
-      db.prepare(
-        `UPDATE services
+      db.prepare(`
+        UPDATE services
            SET period_minutes=?, next_invoice_at=?, status='active'
-         WHERE id=?`
-      ).run(inv.period_minutes, cycleEnd, exist.id);
+         WHERE id=?
+      `).run(inv.period_minutes, cycleEnd, exist.id);
     }
 
-    db.prepare(
-      `UPDATE invoices
+    db.prepare(`
+      UPDATE invoices
          SET cycle_end_at = COALESCE(cycle_end_at, ?)
-       WHERE id=?`
-    ).run(cycleEnd, inv.id);
+       WHERE id=?
+    `).run(cycleEnd, inv.id);
   })();
 
   return {
@@ -147,48 +148,34 @@ function fulfillPaidInvoice(invoiceId, userId) {
     product: inv,
   };
 }
-
-/* ====== UI LISTADO ====== */
-router.get("/", ensureAuth, (req,res)=>{
-  const site = db.getSetting("site_name","SkyShop");
-  const logo = db.getSetting("logo_url","");
+/* ===================== UI: LISTADO ===================== */
+router.get("/", ensureAuth, (req, res) => {
+  const site = db.getSetting("site_name", "SkyShop");
+  const logo = db.getSetting("logo_url", "");
   const u = req.session.user;
   const isAdmin = !!u.is_admin;
 
-  // Avatar
   const avatarUrl = (u.avatar_url || "").trim();
-  const avatarLetter = String(u.name||"?").charAt(0).toUpperCase();
+  const avatarLetter = String(u.name || "?").charAt(0).toUpperCase();
   const avatarHtml = avatarUrl ? `<img src="${esc(avatarUrl)}" alt="avatar">` : `${avatarLetter}`;
 
   res.type("html").send(`<!doctype html>
 <html lang="es">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${site} · Mis facturas</title>
 <style>
-  :root{
-    --bg:#0b1220; --txt:#e5e7eb; --muted:#9ca3af; --card:#111827; --line:#ffffff15;
-    --accent:#f43f5e; --accent2:#fb7185;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;background:var(--bg);color:var(--txt);min-height:100vh;overflow-x:hidden}
-
-  /* Cielo oscuro */
+  :root{ --bg:#0b1220; --txt:#e5e7eb; --muted:#9ca3af; --card:#111827; --line:#ffffff15; --accent:#f43f5e; --accent2:#fb7185 }
+  *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;background:var(--bg);color:var(--txt);min-height:100vh;overflow-x:hidden}
   .sky{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
   .star{position:absolute;width:2px;height:2px;background:#fff;border-radius:50%;opacity:.9;animation:twinkle 3s linear infinite}
   .shoot{position:absolute;width:140px;height:2px;background:linear-gradient(90deg,#fff,transparent);transform:rotate(18deg);filter:drop-shadow(0 0 6px #ffffff55);animation:shoot 5.5s linear infinite}
   @keyframes twinkle{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}
   @keyframes shoot{0%{transform:translate(-10vw,-10vh) rotate(18deg)}100%{transform:translate(110vw,110vh) rotate(18deg)}}
-
-  /* Modo claro */
   body.light{background:#fff;color:#0b1220}
   .icons{position:fixed;inset:0;z-index:0;pointer-events:none;display:none}
   body.light .icons{display:block}
-  .icons span{position:absolute;font-size:34px;opacity:.24;animation:floatUp linear infinite;filter:saturate(120%) drop-shadow(0 0 1px #00000010)}
-  @media(min-width:900px){.icons span{font-size:40px}}
-  @keyframes floatUp{0%{transform:translateY(20vh);opacity:.0}10%{opacity:.24}90%{opacity:.24}100%{transform:translateY(-30vh);opacity:.0}}
-
-  /* Top + brand + quick + avatar */
+  .icons span{position:absolute;font-size:34px;opacity:.24;animation:floatUp linear infinite}
+  @keyframes floatUp{0%{transform:translateY(20vh);opacity:0}10%{opacity:.24}90%{opacity:.24}100%{transform:translateY(-30vh);opacity:0}}
   .top{position:sticky;top:0;z-index:6;backdrop-filter:blur(8px);background:linear-gradient(#0b1220cc,#0b1220aa);border-bottom:1px solid var(--line)}
   body.light .top{background:linear-gradient(#fff8,#fff6)}
   .nav{max-width:1100px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;gap:12px}
@@ -199,40 +186,17 @@ router.get("/", ensureAuth, (req,res)=>{
   .quick{display:flex;gap:8px;margin-left:6px}
   .qbtn{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;text-decoration:none;font-weight:700;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;border:1px solid #ffffff22}
   .qbtn svg{width:16px;height:16px}
-
   .grow{flex:1}
   .pill{padding:8px 12px;border-radius:999px;background:#ffffff18;border:1px solid #ffffff28;color:inherit;text-decoration:none;cursor:pointer}
   body.light .pill{background:#00000010;border-color:#00000018}
-
-  .avatar{ width:32px;height:32px;border-radius:50%;background:#64748b;color:#fff;display:grid;place-items:center;font-weight:700;overflow:hidden }
+  .avatar{width:32px;height:32px;border-radius:50%;background:#64748b;color:#fff;display:grid;place-items:center;font-weight:700;overflow:hidden}
   .avatar img{width:100%;height:100%;object-fit:cover;display:block}
-
-  /* Drawer */
-  .burger{width:40px;height:40px;display:grid;place-items:center;border-radius:10px;border:1px solid #334155;background:transparent;cursor:pointer}
-  .burger span{width:20px;height:2px;background:currentColor;position:relative;display:block}
-  .burger span:before,.burger span:after{content:"";position:absolute;left:0;right:0;height:2px;background:currentColor}
-  .burger span:before{top:-6px}.burger span:after{top:6px}
-  .drawer{position:fixed;inset:0 auto 0 0;width:300px;transform:translateX(-100%);transition:transform .22s ease;z-index:7}
-  .drawer.open{transform:none}
-  .drawer .panel{height:100%;background:rgba(17,25,40,.85);backdrop-filter:blur(10px);border-right:1px solid var(--line);padding:14px}
-  body.light .drawer .panel{background:#fff}
-  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.35);backdrop-filter:blur(1px);opacity:0;visibility:hidden;transition:.18s ease;z-index:6}
-  .scrim.show{opacity:1;visibility:visible}
-  .navlist a{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid #334155;border-radius:10px;margin-bottom:8px;color:inherit;text-decoration:none}
-  .navlist a:hover{border-color:#64748b}
-  .navlist svg{width:18px;height:18px;opacity:.95}
-
-  /* Dropdown user */
-  .udrop{ position:absolute; right:16px; top:60px; background:var(--card); border:1px solid var(--line); border-radius:12px;
-          padding:10px; width:230px; box-shadow:0 10px 30px #0007; display:none; z-index:9 }
-  body.light .udrop{ background:#fff; }
-  .udrop a{ display:block; padding:8px 10px; border-radius:8px; color:inherit; text-decoration:none; }
-  .udrop a:hover{ background:#ffffff12 } body.light .udrop a:hover{ background:#0000000a }
-
-  /* Content */
+  .udrop{position:absolute;right:16px;top:60px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;width:230px;box-shadow:0 10px 30px #0007;display:none;z-index:9}
+  body.light .udrop{background:#fff}
+  .udrop a{display:block;padding:8px 10px;border-radius:8px;color:inherit;text-decoration:none}
+  .udrop a:hover{background:#ffffff12} body.light .udrop a:hover{background:#0000000a}
   .wrap{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:18px 16px 60px}
-  h1{margin:10px 0 6px}
-  .muted{color:var(--muted)}
+  h1{margin:10px 0 6px}.muted{color:var(--muted)}
   .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:12px}
   body.light .card{background:#fff}
   .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
@@ -253,44 +217,15 @@ router.get("/", ensureAuth, (req,res)=>{
   <div class="sky" id="sky"></div>
   <div class="icons" id="icons"></div>
 
-  <!-- Drawer -->
-  <div class="drawer" id="drawer">
-    <div class="panel">
-      <h3 style="margin:0 0 10px">Menú</h3>
-      <nav class="navlist">
-        <a href="/"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3 1 8h2v5h4V9h2v4h4V8h2L8 3z"/></svg>Inicio</a>
-        <a href="/invoices"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 1h9l1 2v11l-2-1-2 1-2-1-2 1-2-1V1h0Zm2 4h6v2H5V5Zm0 3h6v2H5V8Z"/></svg>Mis facturas</a>
-        <a href="/services"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h12l1 4H1l1-4Zm-1 5h14v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V7Zm3 1v5h8V8H4Z"/></svg>Mis servicios</a>
-        <a href="/tickets"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2a1 1 0 0 0-1 1 1 1 0 0 0 1 1v2a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V9a1 1 0 0 0 1-1 1 1 0 0 0-1-1V5Z"/></svg>Soporte</a>
-        <a href="/profile"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-5 7v-1a5 5 0 0 1 10 0v1H3z"/></svg>Mi perfil</a>
-        ${isAdmin ? `<a href="/admin"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M7 1h2l1 3h3l-2 2 1 3-3-1-2 2-2-2-3 1 1-3L1 4h3l1-3z"/></svg>Admin</a>`:""}
-        <a href="/logout"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 2h3v2H6v8h3v2H4V2h2zm7 6-3-3v2H7v2h3v2l3-3z"/></svg>Salir</a>
-      </nav>
-    </div>
-  </div>
-  <div id="scrim" class="scrim"></div>
-
   <header class="top">
     <nav class="nav">
-      <button id="menuBtn" class="burger" aria-label="Abrir menú"><span></span></button>
       <div class="brand">
         ${logo ? `<img src="${logo}" alt="logo">` : ``}
         <div class="brand-name">${site}</div>
-
-        <!-- Accesos rápidos (como dashboard) -->
         <div class="quick">
-          <a class="qbtn" href="/">
-            <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3 1 8h2v5h4V9h2v4h4V8h2L8 3z"/></svg>
-            Inicio
-          </a>
-          <a class="qbtn" href="/invoices">
-            <svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 1h9l1 2v11l-2-1-2 1-2-1-2 1-2-1V1h0Zm2 4h6v2H5V5Zm0 3h6v2H5V8Z"/></svg>
-            Facturas
-          </a>
-          <a class="qbtn" href="/services">
-            <svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h12l1 4H1l1-4Zm-1 5h14v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V7Zm3 1v5h8V8H4Z"/></svg>
-            Servicios
-          </a>
+          <a class="qbtn" href="/"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3 1 8h2v5h4V9h2v4h4V8h2L8 3z"/></svg>Inicio</a>
+          <a class="qbtn" href="/invoices"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 1h9l1 2v11l-2-1-2 1-2-1-2 1-2-1V1h0Zm2 4h6v2H5V5Zm0 3h6v2H5V8Z"/></svg>Facturas</a>
+          <a class="qbtn" href="/services"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h12l1 4H1l1-4Zm-1 5h14v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V7Zm3 1v5h8V8H4Z"/></svg>Servicios</a>
         </div>
       </div>
 
@@ -299,7 +234,7 @@ router.get("/", ensureAuth, (req,res)=>{
 
       <div id="ua" class="pill" style="display:flex;gap:8px;align-items:center;position:relative;cursor:pointer">
         <div class="avatar">${avatarHtml}</div>
-        <span>${esc(u.username||"")}</span>
+        <span>${esc(u.username || "")}</span>
         <div id="udrop" class="udrop">
           <div style="padding:6px 8px; font-weight:700">${esc(u.name||"")} ${esc(u.surname||"")}</div>
           <a href="/profile">Mi perfil</a>
@@ -332,12 +267,8 @@ router.get("/", ensureAuth, (req,res)=>{
         <table id="tbl" aria-label="Listado de facturas">
           <thead>
             <tr>
-              <th>Nº</th>
-              <th>Fecha</th>
-              <th>Producto</th>
-              <th>Total</th>
-              <th>Estado</th>
-              <th>Método</th>
+              <th>Nº</th><th>Fecha</th><th>Producto</th>
+              <th>Total</th><th>Estado</th><th>Método</th>
               <th class="right">Acciones</th>
             </tr>
           </thead>
@@ -350,66 +281,8 @@ router.get("/", ensureAuth, (req,res)=>{
   </main>
 
 <script>
-  // Drawer (abre/cierra)
+  // Tema
   (function(){
-    const drawer = document.getElementById('drawer');
-    const scrim  = document.getElementById('scrim');
-    const btn    = document.getElementById('menuBtn');
-    function open(){ drawer.classList.add('open'); scrim.classList.add('show'); }
-    function close(){ drawer.classList.remove('open'); scrim.classList.remove('show'); }
-    btn?.addEventListener('click', open);
-    scrim?.addEventListener('click', close);
-    window.addEventListener('keydown', (e)=>{ if(e.key==='Escape') close(); });
-  })();
-
-  // Dropdown usuario
-  (function(){
-    const a=document.getElementById('ua'), d=document.getElementById('udrop');
-    let open=false;
-    a?.addEventListener('click', (e)=>{ e.stopPropagation(); open=!open; d.style.display=open?'block':'none'; });
-    document.addEventListener('click', ()=>{ if(open){ open=false; d.style.display='none'; }});
-  })();
-
-  // Estrellas (oscuro)
-  ;(function(){
-    const sky = document.getElementById('sky');
-    for(let i=0;i<90;i++){
-      const s=document.createElement('div');
-      s.className='star';
-      s.style.top=(Math.random()*100).toFixed(2)+'%';
-      s.style.left=(Math.random()*100).toFixed(2)+'%';
-      s.style.opacity=(0.35+Math.random()*0.65).toFixed(2);
-      s.style.transform='scale('+(0.6+Math.random()*1.6).toFixed(2)+')';
-      s.style.animationDelay=(Math.random()*3).toFixed(2)+'s';
-      sky.appendChild(s);
-    }
-    for(let i=0;i<2;i++){
-      const sh=document.createElement('div');
-      sh.className='shoot';
-      sh.style.top=(Math.random()*25).toFixed(2)+'%';
-      sh.style.left=(Math.random()*60).toFixed(2)+'%';
-      sh.style.animationDelay=(1+Math.random()*5).toFixed(2)+'s';
-      sky.appendChild(sh);
-    }
-  })();
-
-  // Emojis (claro)
-  ;(function(){
-    const icons=document.getElementById('icons');
-    const set=['🎵','🎬','🎮','📷','🎧','📱','💾','🛒','📺','📀','💡','🚀'];
-    for(let i=0;i<24;i++){
-      const sp=document.createElement('span');
-      sp.textContent=set[i%set.length];
-      sp.style.left=(Math.random()*100).toFixed(2)+'%';
-      sp.style.top=(Math.random()*100).toFixed(2)+'%';
-      sp.style.animationDuration=(20+Math.random()*18).toFixed(1)+'s';
-      sp.style.animationDelay=(Math.random()*8).toFixed(1)+'s';
-      icons.appendChild(sp);
-    }
-  })();
-
-  // Tema 🌙/☀️
-  ;(function(){
     const btn=document.getElementById('mode');
     function apply(mode){
       const light=(mode==='light');
@@ -423,78 +296,65 @@ router.get("/", ensureAuth, (req,res)=>{
     btn.addEventListener('click',()=>apply(document.body.classList.contains('light')?'dark':'light'));
   })();
 
-  // Cargar facturas
-  ;(function(){
-    const q   = document.getElementById('q');
-    const st  = document.getElementById('st');
-    const btn = document.getElementById('refresh');
-    const tb  = document.getElementById('tbody');
+  // Tabla
+  (function(){
+    const q=document.getElementById('q');
+    const st=document.getElementById('st');
+    const btn=document.getElementById('refresh');
+    const tb=document.getElementById('tbody');
     let t=null; function deb(fn,ms){ clearTimeout(t); t=setTimeout(fn,ms||220); }
-
     function h(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
     function fmtD(iso){ try{ return new Date(iso).toLocaleString(); }catch{ return iso||''; } }
 
     async function load(){
       try{
-        const url = '/invoices/api?status='+encodeURIComponent(st.value||'')+'&q='+encodeURIComponent(q.value.trim());
-        const r = await fetch(url, {cache:'no-store'});
-        const data = await r.json();
-        if (!Array.isArray(data)) throw new Error('Formato');
-        if (!data.length){ tb.innerHTML='<tr><td colspan="7" class="muted">Sin resultados.</td></tr>'; return; }
+        const url='/invoices/api?status='+encodeURIComponent(st.value||'')+'&q='+encodeURIComponent(q.value.trim());
+        const r=await fetch(url,{cache:'no-store'});
+        const data=await r.json();
+        if(!Array.isArray(data)){ throw new Error('Formato'); }
+        if(!data.length){ tb.innerHTML='<tr><td colspan="7" class="muted">Sin resultados.</td></tr>'; return; }
         let html='';
         for(const it of data){
-          const isPaid = it.status==='paid';
-          const status = isPaid
-            ? '<span class="badge tag-ok">Pagado</span>'
-            : '<span class="badge tag-warn">Pendiente</span>';
-
-          const pdfBtn = it.pdf_url
-            ? '<a class="btn" href="'+h(it.pdf_url)+'" target="_blank" rel="noopener">PDF</a>'
-            : '<button class="btn" disabled>PDF</button>';
-
-          const payPageBtn = isPaid ? '' : '<a class="btn" href="/invoices/pay/'+it.id+'">Pagar</a>';
-
-          html += '<tr>'
-               +  '<td>'+h(it.number||('INV-'+it.id))+'</td>'
-               +  '<td>'+h(fmtD(it.created_at))+'</td>'
-               +  '<td>'+h(it.product_name||'—')+'</td>'
-               +  '<td>'+h(it.currency)+' '+Number(it.amount||0).toFixed(2)+'</td>'
-               +  '<td>'+status+'</td>'
-               +  '<td><span class="badge">'+h(it.payment_method||'—')+'</span></td>'
-               +  '<td class="right">'+ payPageBtn + (isPaid?'':' ') + ' ' + pdfBtn +'</td>'
-               +  '</tr>';
+          const isPaid=it.status==='paid';
+          const status=isPaid?'<span class="badge tag-ok">Pagado</span>':'<span class="badge tag-warn">Pendiente</span>';
+          const pdfBtn=it.pdf_url?'<a class="btn" href="'+h(it.pdf_url)+'" target="_blank" rel="noopener">PDF</a>':'<button class="btn" disabled>PDF</button>';
+          const payBtn=isPaid?'':' <a class="btn" href="/invoices/pay/'+it.id+'">Pagar</a>';
+          html+='<tr>'
+              +'<td>'+h(it.number||('INV-'+it.id))+'</td>'
+              +'<td>'+h(fmtD(it.created_at))+'</td>'
+              +'<td>'+h(it.product_name||'—')+'</td>'
+              +'<td>'+h(it.currency)+' '+Number(it.amount||0).toFixed(2)+'</td>'
+              +'<td>'+status+'</td>'
+              +'<td><span class="badge">'+h(it.payment_method||'—')+'</span></td>'
+              +'<td class="right">'+payBtn+' '+pdfBtn+'</td>'
+              +'</tr>';
         }
-        tb.innerHTML = html;
+        tb.innerHTML=html;
       }catch(e){
-        tb.innerHTML = '<tr><td colspan="7">Error cargando</td></tr>';
+        tb.innerHTML='<tr><td colspan="7">Error cargando</td></tr>';
       }
     }
-
-    q.addEventListener('input', ()=>deb(load, 200));
-    st.addEventListener('change', load);
-    btn.addEventListener('click', load);
+    q.addEventListener('input',()=>deb(load,200));
+    st.addEventListener('change',load);
+    btn.addEventListener('click',load);
     load();
   })();
 </script>
-</body>
-</html>`);
+</body></html>`);
 });
 
-/* ====== API LISTADO ====== */
-router.get("/api", ensureAuth, (req,res)=>{
+/* ===================== API LISTADO ===================== */
+router.get("/api", ensureAuth, (req, res) => {
   const u = req.session.user;
-  const status = String(req.query.status||"").toLowerCase().trim(); // '', 'paid', 'unpaid'
-  const q = String(req.query.q||"").trim();
+  const status = String(req.query.status || "").toLowerCase().trim(); // '', 'paid', 'unpaid'
+  const q = String(req.query.q || "").trim();
 
   const where = ["i.user_id = ?"];
   const args = [u.id];
 
-  if (status === "paid"){
-    where.push("i.status = 'paid'");
-  } else if (status === "unpaid"){
-    where.push("i.status IN ('pending','unpaid','overdue')");
-  }
-  if (q){
+  if (status === "paid") where.push("i.status = 'paid'");
+  else if (status === "unpaid") where.push("i.status IN ('pending','unpaid','overdue')");
+  if (q) {
     where.push("(i.number LIKE ? OR p.name LIKE ?)");
     const like = `%${q}%`;
     args.push(like, like);
@@ -509,28 +369,26 @@ router.get("/api", ensureAuth, (req,res)=>{
     ORDER BY datetime(i.created_at) DESC, i.id DESC
     LIMIT 200`;
 
-  const rows = db.prepare(sql).all(...args)
-    .map(r=>({
-      id:r.id,
-      number:r.number,
-      amount:r.amount,
-      currency:r.currency,
-      status:r.status,
-      payment_method:r.payment_method,
-      created_at:r.created_at,
-      product_name:r.product_name,
-      pdf_url: r.external_id ? String(r.external_id) : ""
-    }));
+  const rows = db.prepare(sql).all(...args).map(r => ({
+    id: r.id,
+    number: r.number,
+    amount: r.amount,
+    currency: r.currency,
+    status: r.status,
+    payment_method: r.payment_method,
+    created_at: r.created_at,
+    product_name: r.product_name,
+    pdf_url: r.external_id ? String(r.external_id) : ""
+  }));
 
   res.json(rows);
 });
-
-/* ====== UI PAGO DE UNA FACTURA (opciones) ====== */
-router.get("/pay/:id", ensureAuth, (req,res)=>{
-  const site = db.getSetting("site_name","SkyShop");
-  const logo = db.getSetting("logo_url","");
+/* ===================== UI: PAGO DE UNA FACTURA ===================== */
+router.get("/pay/:id", ensureAuth, (req, res) => {
+  const site = db.getSetting("site_name", "SkyShop");
+  const logo = db.getSetting("logo_url", "");
   const u = req.session.user;
-  const id = Number(req.params.id||0);
+  const id = Number(req.params.id || 0);
 
   const inv = db.prepare(`
     SELECT i.*, p.name AS product_name, p.description AS product_description, p.image_path, p.id AS pid
@@ -540,17 +398,15 @@ router.get("/pay/:id", ensureAuth, (req,res)=>{
   `).get(id, u.id);
   if (!inv) return res.status(404).send("Factura no encontrada.");
 
-  // recordar para retornos sin id
   try { req.session.last_invoice_id = inv.id; } catch {}
 
-  // si ya está pagada → confirm
-  if (inv.status === 'paid') {
+  if (inv.status === "paid") {
     return res.redirect(302, `/invoices/confirm/${inv.id}`);
   }
 
   const balUSD = db.prepare(`SELECT balance FROM credits WHERE user_id=? AND currency='USD'`).get(u.id)?.balance || 0;
   const balMXN = db.prepare(`SELECT balance FROM credits WHERE user_id=? AND currency='MXN'`).get(u.id)?.balance || 0;
-  const canPay = (inv.currency==='USD' ? balUSD : balMXN) >= inv.amount;
+  const canPay = (inv.currency === "USD" ? balUSD : balMXN) >= inv.amount;
 
   // ===== flags PayPal + URLs =====
   const ppApiEnabled = db.getSetting("paypal_api_enabled","0")==="1"
@@ -584,8 +440,6 @@ router.get("/pay/:id", ensureAuth, (req,res)=>{
   .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 12px;border-radius:12px;background:var(--accent);color:#fff;text-decoration:none;border:0;cursor:pointer}
   .btn[disabled]{opacity:.5;cursor:not-allowed}
   .alt{display:inline-flex;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#ffffff10;color:inherit;text-decoration:none}
-
-  /* Modal */
   .modal{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;place-items:center;z-index:30}
   .modal.show{display:grid}
   .panel{background:#0b1325;border:1px solid #ffffff22;border-radius:16px;max-width:520px;width:92%;padding:14px}
@@ -619,7 +473,6 @@ router.get("/pay/:id", ensureAuth, (req,res)=>{
       </div>
 
       <div class="row" style="margin-top:12px; gap:8px; align-items:center">
-
         <!-- Créditos -->
         <form method="post" action="/invoices/pay/${inv.id}/credits" style="display:inline">
           <button class="btn" type="submit" ${canPay?'':'disabled title="Saldo insuficiente"'}>Pagar con créditos</button>
@@ -632,7 +485,7 @@ router.get("/pay/:id", ensureAuth, (req,res)=>{
         <button id="paypalBtn" class="alt" type="button">PayPal</button>
 
         <!-- Stripe -->
-        <a class="alt" href="/pay/stripe?invoice_id=${inv.id}">Stripe</a>
+<a class="alt" href="/pay/stripe?pid=${inv.pid || inv.product_id}">Stripe</a>
       </div>
     </section>
   </main>
@@ -716,34 +569,28 @@ router.get("/pay/:id", ensureAuth, (req,res)=>{
 
     function startIPN(){
       try{
-        // rellena el webscr directo como en product.js
         const f = ipnForm;
         const suffix = Date.now().toString(36);
         f.item_name.value = itemName;
         f.invoice.value = (invNumber || ('INV-' + String(invId))) + '-' + suffix;
-        f.custom.value  = String(invId);                  // para que el IPN local identifique la factura
-        f.notify_url.value = notify;                      // listener IPN
+        f.custom.value  = String(invId);
+        f.notify_url.value = notify;
         f.return.value  = base + '/invoices/confirm/' + String(invId) + '?paid=paypal_ipn';
         f.cancel_return.value = base + '/invoices/confirm/' + String(invId) + '?canceled=1';
         f.submit();
-      }catch(e){
-        alert('Error iniciando PayPal: ' + e.message);
-      }finally{
-        close();
-      }
+      }catch(e){ alert('Error iniciando PayPal: ' + e.message); }
+      finally{ close(); }
     }
   })();
 </script>
-</body>
-</html>`);
+</body></html>`);
 });
-
-/* ====== POST PAGO CON CRÉDITOS (con fulfillment) ====== */
-router.post("/pay/:id/credits", ensureAuth, async (req,res)=>{
+/* ===================== POST: PAGO CON CRÉDITOS ===================== */
+router.post("/pay/:id/credits", ensureAuth, async (req, res) => {
   const u = req.session.user;
-  const id = Number(req.params.id||0);
+  const id = Number(req.params.id || 0);
 
-  const inv = db.prepare(`SELECT * FROM invoices WHERE id=? AND user_id=?`).get(id,u.id);
+  const inv = db.prepare(`SELECT * FROM invoices WHERE id=? AND user_id=?`).get(id, u.id);
   if (!inv) return res.status(404).send("Factura no encontrada.");
   if (inv.status === "paid") return res.redirect(`/invoices/confirm/${id}`);
 
@@ -751,21 +598,19 @@ router.post("/pay/:id/credits", ensureAuth, async (req,res)=>{
   const bal = db.prepare(`SELECT balance FROM credits WHERE user_id=? AND currency=?`).get(u.id, cur)?.balance || 0;
   if (bal < inv.amount) return res.status(400).send("Saldo insuficiente.");
 
-  // Traemos producto (para PDF) y user info
   const product = inv.product_id ? db.prepare(`SELECT * FROM products WHERE id=?`).get(inv.product_id) : null;
   const user = db.prepare(`SELECT id,username,name,surname,email,phone FROM users WHERE id=?`).get(u.id);
   const site = db.getSetting("site_name","SkyShop");
   const logo = db.getSetting("logo_url","");
 
-  // Pagar
-  const now = new Date().toISOString();
+  const nowISO = new Date().toISOString();
   const number = inv.number || nextInvoiceNumber();
 
-  const txRes = db.transaction(()=>{
+  const saved = db.transaction(() => {
     db.prepare(`INSERT OR IGNORE INTO credits(user_id,currency,balance) VALUES(?,?,0)`).run(u.id, cur);
     db.prepare(`UPDATE credits SET balance=balance-? WHERE user_id=? AND currency=?`).run(inv.amount, u.id, cur);
     db.prepare(`UPDATE invoices SET number=?, status='paid', payment_method='credits', paid_at=? WHERE id=?`)
-      .run(number, now, id);
+      .run(number, nowISO, id);
     return db.prepare(`SELECT * FROM invoices WHERE id=?`).get(id);
   })();
 
@@ -773,25 +618,27 @@ router.post("/pay/:id/credits", ensureAuth, async (req,res)=>{
   fulfillPaidInvoice(id, u.id);
 
   // PDF si falta
-  let pdfUrl = txRes.external_id;
   try{
-    if (!pdfUrl){
-      const url = await createInvoicePDF(
-        { ...txRes, status: "paid" },
+    if (!saved.external_id){
+      const pdfRel = await createInvoicePDF({
+        number,
+        site,
+        logoUrl: logo,
         user,
         product,
-        site,
-        logo
-      );
-      db.prepare(`UPDATE invoices SET external_id=? WHERE id=?`).run(url, id);
-      pdfUrl = url;
+        amount: inv.amount,
+        currency: inv.currency,
+        createdAt: nowISO,
+        cycleEnd: saved.cycle_end_at || null,
+      });
+      db.prepare(`UPDATE invoices SET external_id=? WHERE id=?`).run(pdfRel, id);
     }
   }catch(e){ console.error("PDF error:", e); }
 
   res.redirect(`/invoices/confirm/${id}`);
 });
 
-/* ====== CONFIRM / SUCCESS (PayPal API/IPN, Stripe y Créditos) ====== */
+/* ===================== CONFIRM / SUCCESS ===================== */
 router.get("/confirm/:id", ensureAuth, async (req, res) => {
   const site = db.getSetting("site_name","SkyShop");
   const logo = db.getSetting("logo_url","");
@@ -815,7 +662,7 @@ router.get("/confirm/:id", ensureAuth, async (req, res) => {
     });
   }
 
-  // Espera si aún está pendiente
+  // Si aún no está marcada como pagada, mostrar espera genérica (sirve para PayPal o Stripe)
   if (result.pending) {
     return res.type("html").send(`<!doctype html>
 <html lang="es">
@@ -831,7 +678,7 @@ router.get("/confirm/:id", ensureAuth, async (req, res) => {
 </style>
 <body><main class="wrap">
   <section class="card">
-    <h2>Esperando confirmación de PayPal…</h2>
+    <h2>Esperando confirmación de pago…</h2>
     <p class="muted">Esto suele tardar unos segundos. No cierres esta ventana.</p>
     <a class="btn" href="/">Volver al panel</a>
   </section>
@@ -860,30 +707,23 @@ router.get("/confirm/:id", ensureAuth, async (req, res) => {
   }
 
   const inv = result.inv;
-  const user = db
-    .prepare(`SELECT id,username,name,surname,email,phone FROM users WHERE id=?`)
-    .get(u.id);
+  const user = db.prepare(`SELECT id,username,name,surname,email,phone FROM users WHERE id=?`).get(u.id);
 
   // Genera PDF si falta
   let pdfRel = inv.external_id;
   try {
     if (!pdfRel || !/^\/uploads\/invoices\/.+\.pdf$/.test(pdfRel)) {
-      await createInvoicePDF({
+      pdfRel = await createInvoicePDF({
         number: inv.number,
         site,
         logoUrl: logo,
         user,
-        product: {
-          name: inv.p_name,
-          description: inv.p_desc,
-          period_minutes: inv.period_minutes,
-        },
+        product: { name: inv.p_name, description: inv.p_desc, period_minutes: inv.period_minutes },
         amount: inv.amount,
         currency: inv.currency,
         createdAt: inv.paid_at || inv.created_at,
         cycleEnd: inv.cycle_end_at,
       });
-      pdfRel = `/uploads/invoices/${inv.number}.pdf`;
       db.prepare(`UPDATE invoices SET external_id=? WHERE id=?`).run(pdfRel, inv.id);
     }
   } catch (e) {}
@@ -922,22 +762,22 @@ router.get("/confirm/:id", ensureAuth, async (req, res) => {
 </main></body></html>`);
 });
 
-/* ====== ALIAS/RETORNOS PayPal ====== */
+/* ===================== ALIAS / RETORNOS PayPal ===================== */
 function extractInvoiceId(req){
-  const b = req.body || {};
-  const q = req.query || {};
-  const p = req.params || {};
+  const b = req.body || {}; const q = req.query || {}; const p = req.params || {};
   const all = { ...q, ...b, ...p };
   const keys = [
     "id","invoice_id","invoice","inv","order_id","order","tx","txn_id",
     "token","paymentId","payerId","PayerID","resource_id","subscription_id","subscriptionID","custom"
   ];
-  for(const k of keys){
+  for (const k of keys){
     const v = all[k];
     if (v==null) continue;
     if (/^\d+$/.test(String(v))) return Number(v);
     if (k==="custom") {
-      try { const j = JSON.parse(String(v)); if (j && j.invoice_id && /^\d+$/.test(String(j.invoice_id))) return Number(j.invoice_id); } catch {}
+      try { const j = JSON.parse(String(v));
+        if (j && j.invoice_id && /^\d+$/.test(String(j.invoice_id))) return Number(j.invoice_id);
+      } catch {}
       if (/^\d+$/.test(String(v))) return Number(v);
     }
   }
@@ -970,7 +810,6 @@ router.get("/confirm", ensureAuth, (req,res)=>{
   const u = req.session.user;
   const fromQuery = Number(req.query.id||0);
   const fromSess  = Number(req.session.last_invoice_id||0);
-
   let id = fromQuery || fromSess;
 
   if (!id) {
