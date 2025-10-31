@@ -6,6 +6,7 @@ const express = require("express");
 const db = require("./db");
 const qs = require("querystring");
 const https = require("https");
+const Stripe = require("stripe"); // Stripe SDK
 
 const router = express.Router();
 
@@ -34,6 +35,38 @@ function getPPEnv(){
     secret: db.getSetting("paypal_api_secret",""),
     apiHost: live ? "api-m.paypal.com" : "api-m.sandbox.paypal.com",
   };
+}
+
+/* ====== Stripe helper (flexible, sin romper PayPal) ====== */
+// Busca la clave en DB y en variables de entorno, soportando varios nombres comunes.
+// Si existe, instancia Stripe; si no, devuelve null (para mostrar el mensaje “no configurado”).
+function getStripe(){
+  // modo opcional
+  const modePref = (db.getSetting("stripe_mode","") || process.env.STRIPE_MODE || "").toLowerCase();
+
+  // candidatos en DB (se toma el primero que esté presente)
+  const dbCandidates = [
+    "stripe_secret_key",
+    modePref==="live" ? "stripe_live_secret" : "",
+    modePref==="test" ? "stripe_test_secret" : "",
+    "stripe_api_secret",
+    "stripe_secret",
+    "stripe_sk"
+  ].map(k => k ? (db.getSetting(k,"") || "").trim() : "").filter(Boolean);
+
+  // candidatos en ENV
+  const envCandidates = [
+    process.env.STRIPE_SECRET_KEY,
+    process.env.STRIPE_API_KEY,
+    process.env.STRIPE_SK,
+    process.env.STRIPE_LIVE_SECRET,
+    process.env.STRIPE_TEST_SECRET
+  ].map(v => (v || "").trim()).filter(Boolean);
+
+  const sk = (dbCandidates[0] || envCandidates[0] || "").trim();
+
+  // no bloqueamos por prefijo; Stripe puede rotar formatos.
+  return sk ? new Stripe(sk, { apiVersion: "2024-06-20" }) : null;
 }
 
 /* ====== PayPal API helpers (auth / create / capture) ====== */
@@ -230,9 +263,9 @@ function drawerHtml(isAdmin){
       <nav class="navlist">
         <a href="/"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3 1 8h2v5h4V9h2v4h4V8h2L8 3z"/></svg>Inicio</a>
         <a href="/invoices"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 1h9l1 2v11l-2-1-2 1-2-1-2 1-2-1V1h0Zm2 4h6v2H5V5Zm0 3h6v2H5V8Z"/></svg>Mis facturas</a>
-        <a href="/services"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h12l1 4H1l1-4Zm-1 5h14v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V7Zm3 1v5h8V8H4Z"/></svg>Mis servicios</a>
-        <a href="/tickets"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 5a2 2 0 0 1 2-2h10a2 2 0  0 1 2 2v2a1 1 0 0 0-1 1 1 1 0 0 0 1 1v2a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V9a1 1 0 0 0 1-1 1 1 0 0 0-1-1V5Z"/></svg>Soporte</a>
-        <a href="/profile"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-5 7v-1a5 5 0  0 1 10 0v1H3z"/></svg>Mi perfil</a>
+        <a href="/services"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h12l1 4H1l1-4Zm-1 5h14v6a1 1 0 0 1-1 1H2a1 1 0  0 1-1-1V7Zm3 1v5h8V8H4Z"/></svg>Mis servicios</a>
+        <a href="/tickets"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 5a2 2 0  0 1 2-2h10a2 2 0 0 1 2 2v2a1 1 0 0 0-1 1 1 1 0 0 0 1 1v2a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V9a1 1 0 0 0 1-1 1 1 0 0 0-1-1V5Z"/></svg>Soporte</a>
+        <a href="/profile"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 8a3 3 0  1 0 0-6 3 3 0  0 0 0 6Zm-5 7v-1a5 5 0  0 1 10 0v1H3z"/></svg>Mi perfil</a>
         ${isAdmin ? `<a href="/admin"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M7 1h2l1 3h3l-2 2 1 3-3-1-2 2-2-2-3 1 1-3L1 4h3l1-3z"/></svg>Admin</a>` : ``}
         <a href="/logout"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M6 2h3v2H6v8h3v2H4V2h2zm7 6-3-3v2H7v2h3v2l3-3z"/></svg>Salir</a>
       </nav>
@@ -256,7 +289,7 @@ function topBar(site, logo, u){
         <div class="quick">
           <a class="qbtn" href="/"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 3 1 8h2v5h4V9h2v4h4V8h2L8 3z"/></svg>Inicio</a>
           <a class="qbtn" href="/invoices"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 1h9l1 2v11l-2-1-2 1-2-1-2 1-2-1V1h0Zm2 4h6v2H5V5Zm0 3h6v2H5V8Z"/></svg>Facturas</a>
-          <a class="qbtn" href="/services"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h12l1 4H1l1-4Zm-1 5h14v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V7Zm3 1v5h8V8H4Z"/></svg>Servicios</a>
+          <a class="qbtn" href="/services"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 2h12l1 4H1l1-4Zm-1 5h14v6a1 1 0 0 1-1 1H2a1 1 0  0 1-1-1V7Zm3 1v5h8V8H4Z"/></svg>Servicios</a>
         </div>
       </div>
       <div class="grow"></div>
@@ -371,7 +404,7 @@ ${sharedHead(site)}
             ${paypalIcon()} PayPal
           </button>
 
-          <!-- Stripe tarjeta -->
+          <!-- Stripe tarjeta (POST seguro) -->
           <button id="stripeBtn" class="paybtn stripe" type="button" title="Pagar con tarjeta">
             ${stripeIcon()} Stripe (tarjeta)
           </button>
@@ -401,6 +434,11 @@ ${sharedHead(site)}
     <input type="hidden" name="cancel_return" value="">
     <input type="hidden" name="no_shipping" value="1">
     <input type="hidden" name="rm" value="1">
+  </form>
+
+  <!-- Stripe (POST -> crea sesión de Checkout) -->
+  <form id="stripeForm" method="post" action="/comprar-creditos/stripe/start" style="display:none">
+    <input type="hidden" name="topup_id" value="">
   </form>
 
   <!-- Modal selector PayPal -->
@@ -434,6 +472,7 @@ ${sharedTopJs()}
     const stripeBtn = document.getElementById('stripeBtn');
     const apiForm = document.getElementById('ppApiForm');
     const ipnForm = document.getElementById('ppIpnForm');
+    const stripeForm = document.getElementById('stripeForm');
 
     const m = document.getElementById('ppModal');
     const apiReady = ${ppApiEnabled ? 'true' : 'false'};
@@ -455,7 +494,6 @@ ${sharedTopJs()}
     drawQuick();
 
     async function ensureTopup(){
-      // valida inputs
       const val = parseFloat(amount.value);
       if (!(val>0)) { alert('Escribe un monto válido.'); throw new Error('invalid'); }
       const params = new URLSearchParams();
@@ -492,11 +530,12 @@ ${sharedTopJs()}
       }catch(e){}
     });
 
-    // Stripe click
+    // Stripe click (POST seguro)
     stripeBtn?.addEventListener('click', async ()=>{
       try{
         const t = currentTopup || await ensureTopup();
-        location.href = '/pay/stripe?topup_id=' + String(t.id);
+        stripeForm.topup_id.value = String(t.id);
+        stripeForm.submit();
       }catch(e){}
     });
 
@@ -607,9 +646,12 @@ ${sharedHead(site)}
       <p class="muted">ID de recarga: #${t.id}</p>
 
       <div class="paygrid" style="margin-top:12px">
-        <a class="paybtn stripe" href="/pay/stripe?topup_id=${t.id}" title="Pagar con tarjeta">
-          ${stripeIcon()} Stripe (tarjeta)
-        </a>
+        <form id="stripeForm2" method="post" action="/comprar-creditos/stripe/start">
+          <input type="hidden" name="topup_id" value="${t.id}">
+          <button class="paybtn stripe" type="submit" title="Pagar con tarjeta">
+            ${stripeIcon()} Stripe (tarjeta)
+          </button>
+        </form>
         <button id="paypalBtn" class="paybtn paypal" type="button" title="Pagar con PayPal">
           ${paypalIcon()} PayPal
         </button>
@@ -687,6 +729,101 @@ ${sharedTopJs()}
 </body></html>`);
 });
 
+/* ========== Stripe start (crea sesión de Checkout para topup) ========== */
+router.post(
+  "/comprar-creditos/stripe/start",
+  ensureAuth,
+  express.urlencoded({extended:false}),
+  async (req,res)=>{
+    const u = req.session.user;
+    const id = Number(req.body.topup_id||0);
+    if (!id) return res.status(400).send("Falta topup_id");
+
+    const t = db.prepare(`SELECT * FROM credit_topups WHERE id=? AND user_id=? LIMIT 1`).get(id, u.id);
+    if (!t) return res.status(404).send("Recarga no encontrada.");
+    if (t.status === 'paid') return res.redirect(302, `/comprar-creditos/confirm/${t.id}`);
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(400).send("Stripe no está configurado.");
+
+    const base = baseUrl(req);
+    try{
+      const session = await stripe.checkout.sessions.create({
+        mode: "payment",
+        payment_method_types: ["card"],
+        line_items: [{
+          price_data: {
+            currency: String(t.currency||"USD").toLowerCase(), // usd/mxn
+            product_data: {
+              name: `Recarga de créditos (${t.currency})`,
+              description: `Usuario #${u.id} · Topup #${t.id}`
+            },
+            unit_amount: Math.round(Number(t.amount)*100) // centavos
+          },
+          quantity: 1
+        }],
+        metadata: {
+          kind: "credit_topup",
+          topup_id: String(t.id),
+          user_id: String(u.id)
+        },
+        success_url: `${base}/comprar-creditos/stripe/return?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${base}/comprar-creditos/confirm/${t.id}?canceled=1`
+      });
+
+      // Guarda ref de Stripe (por si el usuario no vuelve)
+      db.prepare(`UPDATE credit_topups SET provider='stripe', provider_ref=? WHERE id=? AND provider_ref IS NULL`)
+        .run(session.id, t.id);
+
+      return res.redirect(303, session.url);
+    }catch(err){
+      console.error("Stripe start error:", err);
+      return res.status(500).send("No se pudo iniciar Stripe");
+    }
+  }
+);
+
+/* ========== Stripe return (confirma y acredita saldo) ========== */
+router.get("/comprar-creditos/stripe/return", ensureAuth, async (req,res)=>{
+  const stripe = getStripe();
+  const sid = String(req.query.session_id||"").trim();
+  if (!stripe || !sid) return res.redirect("/comprar-creditos");
+
+  const u = req.session.user;
+
+  try{
+    const sess = await stripe.checkout.sessions.retrieve(sid, { expand: ["payment_intent"] });
+    const topupId = Number(sess?.metadata?.topup_id || 0);
+    if (!topupId) return res.redirect("/comprar-creditos");
+
+    const t = db.prepare(`SELECT * FROM credit_topups WHERE id=? AND user_id=?`).get(topupId, u.id);
+    if (!t) return res.status(404).send("Recarga no encontrada.");
+
+    if (sess.payment_status === "paid" && t.status !== "paid"){
+      const pi = typeof sess.payment_intent === "object" ? sess.payment_intent.id : (sess.payment_intent || sid);
+
+      const tx = db.transaction(()=>{
+        db.prepare(`
+          UPDATE credit_topups
+          SET status='paid', provider='stripe', provider_ref=?, paid_at=datetime('now')
+          WHERE id=? AND status<>'paid'
+        `).run(pi, t.id);
+
+        db.prepare(`INSERT OR IGNORE INTO credits(user_id,currency,balance) VALUES(?,?,0)`)
+          .run(t.user_id, t.currency);
+        db.prepare(`UPDATE credits SET balance=balance+? WHERE user_id=? AND currency=?`)
+          .run(t.amount, t.user_id, t.currency);
+      });
+      tx();
+    }
+
+    return res.redirect(302, `/comprar-creditos/confirm/${topupId}`);
+  }catch(err){
+    console.error("Stripe return error:", err);
+    return res.redirect(302, `/comprar-creditos`);
+  }
+});
+
 /* ========== PayPal API: create / return / cancel para TOPUPS ========== */
 router.post("/comprar-creditos/paypal/api/create", ensureAuth, express.urlencoded({extended:false}), async (req,res)=>{
   const u = req.session.user;
@@ -750,8 +887,8 @@ router.get("/comprar-creditos/paypal/api/cancel", ensureAuth, (req,res)=>{
 
 /* ========== Confirmación/éxito de la recarga ========== */
 router.get("/comprar-creditos/confirm/:id", ensureAuth, (req,res)=>{
-  const site = db.getSetting("site_name","SkyShop");
-  const logo = db.getSetting("logo_url","");
+  const site = db.getSetting("site_name", "SkyShop");
+  const logo = db.getSetting("logo_url", "");
   const u = req.session.user;
   const id = Number(req.params.id||0);
   const t = db.prepare(`SELECT * FROM credit_topups WHERE id=? AND user_id=?`).get(id, u.id);
