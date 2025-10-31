@@ -1,4 +1,4 @@
-// pay_paypal.js — Pasarela PayPal (Orders API + IPN real)
+// pay_paypal.js — Pasarela PayPal (Orders API + IPN real) con soporte de productos COMPARTIDOS
 "use strict";
 
 const express = require("express");
@@ -16,6 +16,7 @@ function ensureAuth(req, res, next) {
 }
 const get = (k, d = "") => db.getSetting(k, d);
 const enabled = (k) => String(db.getSetting(k, "0")) === "1";
+const FAR_FUTURE = "2099-12-31T00:00:00.000Z";
 
 function apiRoot() {
   return get("paypal_api_mode", "sandbox") === "live"
@@ -56,6 +57,46 @@ function fmtDate(iso) {
 }
 function esc(s) {
   return String(s == null ? "" : s);
+}
+function tryDeletePDF(external_id) {
+  if (!external_id) return;
+  const rel = String(external_id).replace(/^\/+/, "");
+  const abs = path.resolve(process.cwd(), rel);
+  const safeBase = path.resolve(process.cwd(), "uploads", "invoices");
+  if (abs.startsWith(safeBase)) {
+    try { if (fs.existsSync(abs)) fs.unlinkSync(abs); } catch {}
+  }
+}
+
+/* ====== helpers de COMPARTIDOS ====== */
+function countPoolAvailable(productId){
+  const r = db.prepare(`
+    SELECT COUNT(*) AS n
+    FROM product_shared_items
+    WHERE product_id=? AND revealed_to_user_id IS NULL
+  `).get(productId);
+  return Number(r?.n || 0);
+}
+function assignNextSharedItem(productId, userId){
+  const nowISO = new Date().toISOString();
+  return db.transaction(()=>{
+    const row = db.prepare(`
+      SELECT id, content, order_index
+      FROM product_shared_items
+      WHERE product_id=? AND revealed_to_user_id IS NULL
+      ORDER BY order_index ASC
+      LIMIT 1
+    `).get(productId);
+    if (!row) throw new Error("No hay información disponible para entregar.");
+
+    db.prepare(`
+      UPDATE product_shared_items
+      SET revealed_to_user_id=?, revealed_at=?
+      WHERE id=?
+    `).run(userId, nowISO, row.id);
+
+    return { content: row.content, order_index: row.order_index, revealed_at: nowISO };
+  })();
 }
 
 /* === generar PDF simple (igual estilo a invoices.js) === */
@@ -146,15 +187,45 @@ router.post("/pay/paypal/api/create", ensureAuth, async (req, res) => {
     if (String(inv.status).toLowerCase() === "paid")
       return res.status(409).send("Esta factura ya está pagada.");
 
+    // ===== Validaciones de producto / disponibilidad =====
+    const p = inv.product_id
+      ? db.prepare(`SELECT * FROM products WHERE id=? AND active=1`).get(inv.product_id)
+      : null;
+    if (!p) return res.status(400).send("Producto inválido o inactivo.");
+
+    const isShared    = String(p.delivery_mode || "single") === "shared";
+    const isOneTime   = String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0;
+    const isRecurring = !isOneTime;
+
+    // Bloqueos de recompra:
+    if ((!isShared && isOneTime) || isRecurring){
+      const hasActive = !!db.prepare(`
+        SELECT 1 FROM services WHERE user_id=? AND product_id=? AND status='active'
+      `).get(u.id, p.id);
+      if (hasActive){
+        return res.status(400).send(isOneTime
+          ? "Este producto de pago único ya fue adquirido."
+          : "Este servicio ya está activo.");
+      }
+    }
+
+    // Disponibilidad
+    if (isShared){
+      if (countPoolAvailable(p.id) <= 0){
+        return res.status(400).send("Sin información disponible para este producto compartido.");
+      }
+    }else{
+      if (typeof p.stock === "number" && p.stock === 0){
+        return res.status(400).send("Sin stock.");
+      }
+    }
+
     const site = get("site_name", "SkyShop");
     const access = await getAccessToken();
 
     const desc =
       inv.description ||
-      (inv.product_id
-        ? db.prepare(`SELECT name FROM products WHERE id=?`).get(inv.product_id)
-            ?.name || "Producto"
-        : "Factura");
+      (p?.name || "Producto");
 
     const orderBody = {
       intent: "CAPTURE",
@@ -162,7 +233,7 @@ router.post("/pay/paypal/api/create", ensureAuth, async (req, res) => {
         {
           reference_id: "inv-" + inv.id,
           custom_id: String(inv.id),
-          // Usar un invoice_id único para evitar DUPLICATE_INVOICE_ID al reintentar
+          // invoice_id único para evitar DUPLICATE_INVOICE_ID al reintentar
           invoice_id: (inv.number || `INV-${inv.id}`) + "-" + Date.now(),
           description: desc,
           amount: {
@@ -174,10 +245,8 @@ router.post("/pay/paypal/api/create", ensureAuth, async (req, res) => {
       application_context: {
         brand_name: site.slice(0, 127),
         user_action: "PAY_NOW",
-        return_url:
-          baseUrl(req) + `/pay/paypal/return?invoice_id=${inv.id}`,
-        cancel_url:
-          baseUrl(req) + `/pay/paypal/cancel?invoice_id=${inv.id}`,
+        return_url: baseUrl(req) + `/pay/paypal/return?invoice_id=${inv.id}`,
+        cancel_url: baseUrl(req) + `/pay/paypal/cancel?invoice_id=${inv.id}`,
       },
     };
 
@@ -247,13 +316,69 @@ router.get("/pay/paypal/return", ensureAuth, async (req, res) => {
       console.warn("Monto/currency no coinciden con la factura", { curr, value, inv });
     }
 
-    const now = new Date().toISOString();
-    const number = inv.number || db.nextInvoiceNumber();
+    // ====== actualizar factura + service + stock + revelar (si shared)
+    const p = inv.product_id
+      ? db.prepare(`SELECT * FROM products WHERE id=?`).get(inv.product_id)
+      : null;
+
+    const now = new Date();
+    const nowISO = now.toISOString();
+    const pm = Number(p?.period_minutes || 43200);
+    const isOneTime   = p ? (String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0) : false;
+    const isRecurring = p ? !isOneTime : false;
+    const isShared    = p ? (String(p.delivery_mode || "single") === "shared") : false;
+    const nextDue     = isRecurring ? new Date(now.getTime() + pm*60*1000) : now;
+    const cycleEndISO = isRecurring ? nextDue.toISOString() : nowISO;
 
     db.transaction(() => {
-      db.prepare(
-        `UPDATE invoices SET number=?, status='paid', payment_method='paypal', paid_at=? WHERE id=?`
-      ).run(number, now, invoice_id);
+      // Stock para SINGLE
+      if (p && !isShared && typeof p.stock === "number" && p.stock >= 0) {
+        db.prepare(`UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0`).run(p.id);
+      }
+
+      // Crear/actualizar service:
+      // - SINGLE + ÚNICO: crea (bloquea recompra)
+      // - SHARED + ÚNICO: NO crea (permite recompras)
+      // - Cualquier RECURRENTE: crea/actualiza
+      let serviceId = null;
+      if (p && ((!isShared && isOneTime) || isRecurring)){
+        db.prepare(`
+          INSERT INTO services(user_id,product_id,period_minutes,next_invoice_at,status)
+          VALUES(?,?,?,?, 'active')
+          ON CONFLICT(user_id,product_id) DO UPDATE SET
+            period_minutes=excluded.period_minutes,
+            next_invoice_at=excluded.next_invoice_at,
+            status='active'
+        `).run(u.id, p.id, isRecurring ? pm : 0, isRecurring ? nextDue.toISOString() : FAR_FUTURE);
+        const svc = db.prepare(`SELECT id FROM services WHERE user_id=? AND product_id=?`).get(u.id, p.id);
+        serviceId = svc?.id || null;
+      }
+
+      // Marcar factura pagada
+      const number = inv.number || db.nextInvoiceNumber();
+      db.prepare(`
+        UPDATE invoices
+           SET number=?,
+               status='paid',
+               payment_method='paypal',
+               paid_at=?,
+               due_at=?,
+               cycle_end_at=?,
+               service_id=COALESCE(?, service_id)
+         WHERE id=?
+      `).run(number, nowISO, nowISO, cycleEndISO, serviceId, invoice_id);
+
+      // Revelar si es compartido
+      if (p && isShared){
+        assignNextSharedItem(p.id, u.id);
+      }
+
+      // Limpiar otras pendientes
+      const leftovers = db.prepare(`
+        SELECT id, external_id FROM invoices
+        WHERE user_id=? AND product_id=? AND status IN ('pending','unpaid','overdue') AND id<>?
+      `).all(u.id, p?.id || 0, invoice_id);
+      leftovers.forEach(r => { tryDeletePDF(r.external_id); db.prepare(`DELETE FROM invoices WHERE id=?`).run(r.id); });
     })();
 
     // Crear PDF si falta
@@ -416,10 +541,9 @@ router.post(
       const cfgEmail = get("paypal_ipn_email", "");
       if (cfgEmail && receiver_email && cfgEmail.toLowerCase() !== receiver_email.toLowerCase()) {
         console.warn("IPN: receiver_email no coincide", { cfgEmail, receiver_email });
-        // Continuamos pero lo registramos; si quieres, puedes return aquí.
+        // se registra, pero no abortamos
       }
 
-      // status y montos
       if (payment_status !== "Completed") {
         console.warn("IPN: pago no Completed", payment_status);
         return res.status(200).end();
@@ -431,14 +555,59 @@ router.post(
         console.warn("IPN: monto/currency no cuadra", { gross, currency, inv });
       }
 
-      // 4.3 Marcar pagado si no lo está
+      // ====== actualizar factura + service + stock + revelar (si shared)
+      const p = inv.product_id
+        ? db.prepare(`SELECT * FROM products WHERE id=?`).get(inv.product_id)
+        : null;
+      const userId = inv.user_id;
+
+      const now = new Date();
+      const nowISO = now.toISOString();
+      const pm = Number(p?.period_minutes || 43200);
+      const isOneTime   = p ? (String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0) : false;
+      const isRecurring = p ? !isOneTime : false;
+      const isShared    = p ? (String(p.delivery_mode || "single") === "shared") : false;
+      const nextDue     = isRecurring ? new Date(now.getTime() + pm*60*1000) : now;
+      const cycleEndISO = isRecurring ? nextDue.toISOString() : nowISO;
+
+      // 4.3 Marcar pagado si no lo está + efectos colaterales
       if (String(inv.status).toLowerCase() !== "paid") {
-        const now = new Date().toISOString();
-        const number = inv.number || db.nextInvoiceNumber();
         db.transaction(() => {
+          // Stock solo SINGLE
+          if (p && !isShared && typeof p.stock === "number" && p.stock >= 0) {
+            db.prepare(`UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0`).run(p.id);
+          }
+
+          // Crear/actualizar service (misma regla que en API Return)
+          let serviceId = null;
+          if (p && ((!isShared && isOneTime) || isRecurring)){
+            db.prepare(`
+              INSERT INTO services(user_id,product_id,period_minutes,next_invoice_at,status)
+              VALUES(?,?,?,?, 'active')
+              ON CONFLICT(user_id,product_id) DO UPDATE SET
+                period_minutes=excluded.period_minutes,
+                next_invoice_at=excluded.next_invoice_at,
+                status='active'
+            `).run(userId, p.id, isRecurring ? pm : 0, isRecurring ? nextDue.toISOString() : FAR_FUTURE);
+            const svc = db.prepare(`SELECT id FROM services WHERE user_id=? AND product_id=?`).get(userId, p.id);
+            serviceId = svc?.id || null;
+          }
+
+          const number = inv.number || db.nextInvoiceNumber();
           db.prepare(
-            `UPDATE invoices SET number=?, status='paid', payment_method='paypal_ipn', paid_at=? WHERE id=?`
-          ).run(number, now, inv.id);
+            `UPDATE invoices SET number=?, status='paid', payment_method='paypal_ipn', paid_at=?, due_at=?, cycle_end_at=?, service_id=COALESCE(?, service_id) WHERE id=?`
+          ).run(number, nowISO, nowISO, cycleEndISO, serviceId, inv.id);
+
+          if (p && isShared){
+            assignNextSharedItem(p.id, userId);
+          }
+
+          // Limpiar pendientes duplicadas
+          const leftovers = db.prepare(`
+            SELECT id, external_id FROM invoices
+            WHERE user_id=? AND product_id=? AND status IN ('pending','unpaid','overdue') AND id<>?
+          `).all(userId, p?.id || 0, inv.id);
+          leftovers.forEach(r => { tryDeletePDF(r.external_id); db.prepare(`DELETE FROM invoices WHERE id=?`).run(r.id); });
         })();
 
         // PDF si falta
