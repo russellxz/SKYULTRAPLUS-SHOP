@@ -131,7 +131,7 @@ router.get("/", ensureAdmin, (req, res) => {
           Facturas
         </a>
         <a href="/admin/tickets" data-match="^/admin/tickets">
-          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2a1 1 0 0 0-1 1 1 1 0  0 0 1 1v2a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V9a1 1 0 0 0 1-1 1 1 0 0 0-1-1V5Z"/></svg>
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M1 5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2a1 1 0 0 0-1 1 1 1 0  0 0 1 1v2a2 2 0 0 1-2 2H3a2 2 0  0 1-2-2V9a1 1 0 0 0 1-1 1 1 0  0 0-1-1V5Z"/></svg>
           Tickets
         </a>
       </nav>
@@ -147,6 +147,8 @@ router.get("/", ensureAdmin, (req, res) => {
         <a class="btn blue" href="/admin/paypal">Configurar PayPal</a>
         <a class="btn blue" href="/admin/stripe">Configurar Stripe</a>
         <a class="btn blue" href="/admin/whatsapp">Vincular WhatsApp (Bot)</a>
+        <!-- NUEVO botón, sin tocar más lógica -->
+        <a class="btn blue" href="/admin/terminos" title="Configurar Términos y Condiciones">Términos & Condiciones</a>
       </div>
     </section>
 
