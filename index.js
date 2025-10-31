@@ -131,7 +131,10 @@ app.use("/admin", require("./admin_user_edit"));
 app.use("/tickets", require("./tickets"));
 app.use("/admin", require("./admin_tickets"));
 app.use("/admin", require("./admin_stripe"));
-
+// ...
+app.use("/admin/terminos", require("./adminterminos"));
+app.use("/terminos", require("./public-terminos"));
+// ...
 /* Panel de WhatsApp */
 app.use("/", require("./admin_whatsapp"));
 
