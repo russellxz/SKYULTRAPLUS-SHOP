@@ -63,7 +63,11 @@ function assignNextSharedItem(productId, userId){
   })();
 }
 
-/* ===== GET /pay/stripe?pid=XX — crea sesión de Checkout ===== */
+/* ===== GET /pay/stripe — crea sesión de Checkout =====
+ * Soporta:
+ *   - /pay/stripe?invoice_id=XXX  (pago de factura EXISTENTE)
+ *   - /pay/stripe?pid=XXX         (compra directa / o pago desde factura si aún mandan pid)
+ */
 router.get("/stripe", ensureAuth, async (req, res) => {
   const enabled = getS("stripe_enabled", "0") === "1";
   const pk = getS("stripe_pk", "");
@@ -76,8 +80,86 @@ router.get("/stripe", ensureAuth, async (req, res) => {
   }
 
   const u = req.session.user;
+  const base = absoluteBase(req);
+
+  /* ---------- RUTA A: pagar una FACTURA existente ---------- */
+  const invoiceId = Number(req.query.invoice_id || 0);
+  if (invoiceId) {
+    const inv = db.prepare(`
+      SELECT i.*, p.name AS p_name
+      FROM invoices i
+      LEFT JOIN products p ON p.id=i.product_id
+      WHERE i.id=? AND i.user_id=? AND i.status IN ('pending','unpaid','overdue')
+      LIMIT 1
+    `).get(invoiceId, u.id);
+    if (!inv) return res.status(404).type("text/plain").send("Factura no encontrada o no pagable.");
+
+    const currency = String(inv.currency||"USD").toUpperCase();
+    const curLower = currency.toLowerCase();
+    const amount   = Number(inv.amount||0);
+    const min = MINIMUMS[curLower] ?? 0.50;
+    if (amount < min){
+      return res.type("html").send(`<!doctype html><meta charset="utf-8">
+        <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
+          <h2 style="margin:0 0 8px">Importe demasiado bajo para Stripe</h2>
+          <p>Stripe exige un mínimo de <b>${currency} ${min.toFixed(2)}</b>. 
+          Esta factura es de <b>${currency} ${amount.toFixed(2)}</b>.</p>
+          <p><a href="/invoices/pay/${inv.id}">← Volver a la factura</a></p>
+        </div>`);
+    }
+
+    try{
+      const cli = getStripe();
+      if (!cli) throw new Error("Stripe no inicializado");
+
+      const session = await cli.checkout.sessions.create({
+        mode: "payment",
+        line_items: [{
+          price_data: {
+            currency: curLower,
+            product_data: { name: inv.p_name || `Factura #${inv.number || inv.id}` },
+            unit_amount: Math.round(amount * 100),
+          },
+          quantity: 1,
+        }],
+        allow_promotion_codes: false,
+        metadata: {
+          invoice_id: String(inv.id),
+          product_id: String(inv.product_id || ""),
+          user_id: String(u.id),
+        },
+        payment_intent_data: {
+          metadata: {
+            invoice_id: String(inv.id),
+            product_id: String(inv.product_id || ""),
+            user_id: String(u.id),
+          }
+        },
+        success_url: `${base}/invoices/confirm/${inv.id}?paid=stripe`,
+        cancel_url:  `${base}/invoices/confirm/${inv.id}?canceled=1`,
+      });
+
+      if (session?.url) return res.redirect(303, session.url);
+      throw new Error("No se pudo obtener la URL de Stripe Checkout.");
+    }catch(err){
+      const code = err?.raw?.code || err?.code || "";
+      const msg  = err?.raw?.message || err?.message || "Error creando sesión";
+      const reqLog = err?.raw?.request_log_url || err?.request_log_url || "";
+      console.error("[stripe] create-session (invoice) error:", { code, msg, request_log_url: reqLog });
+
+      return res.status(400).type("html").send(`<!doctype html><meta charset="utf-8">
+        <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
+          <h2 style="margin:0 0 8px">No se pudo iniciar el pago con Stripe</h2>
+          <p style="color:#ef4444"><b>${escapeHtml(msg)}</b></p>
+          ${reqLog ? `<p class="muted" style="color:#6b7280">Log de Stripe: <a href="${escapeHtml(reqLog)}" target="_blank" rel="noopener">ver</a></p>` : ""}
+          <p><a href="/invoices/pay/${invoiceId}">← Volver a la factura</a></p>
+        </div>`);
+    }
+  }
+
+  /* ---------- RUTA B: compra directa / o desde factura con pid ---------- */
   const pid = Number(req.query.pid || 0);
-  if (!pid) return res.status(400).type("text/plain").send("Producto inválido");
+  if (!pid) return res.status(400).type("text/plain").send("Parámetros inválidos");
 
   const p = db.prepare(`SELECT * FROM products WHERE id=? AND active=1`).get(pid);
   if (!p) return res.status(404).type("text/plain").send("Producto no encontrado");
@@ -86,90 +168,110 @@ router.get("/stripe", ensureAuth, async (req, res) => {
   const isOneTime  = String(p.billing_type) === "one_time" || Number(p.period_minutes) === 0;
   const isRecurring= !isOneTime;
 
-  // Bloqueos de recompra (igual que product.js):
-  // - single + one_time: bloquea si ya tiene activo
-  // - shared + one_time: PERMITE múltiples compras
-  // - cualquier recurrente: bloquea si ya tiene activo
-  if ((!isShared && isOneTime) || isRecurring){
-    const hasActive = !!db.prepare(`SELECT 1 FROM services WHERE user_id=? AND product_id=? AND status='active'`)
-      .get(u.id, p.id);
-    if (hasActive){
-      return res.status(400).type("html").send(
-        `<!doctype html><meta charset="utf-8"><div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
-          <h2 style="margin:0 0 8px">No disponible</h2>
-          <p>${isOneTime ? "Este producto de pago único ya fue adquirido." : "Este servicio ya está activo."}</p>
-          <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
-        </div>`
-      );
-    }
-  }
-
-  // Disponibilidad
-  if (isShared){
-    if (countPoolAvailable(p.id) <= 0){
-      return res.status(400).type("html").send(`<!doctype html><meta charset="utf-8">
-        <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
-          <h2 style="margin:0 0 8px">Sin información disponible</h2>
-          <p>Este producto compartido no tiene elementos disponibles por ahora.</p>
-          <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
-        </div>`);
-    }
-  }else{
-    const outOfStock = (typeof p.stock === "number") && p.stock === 0;
-    if (outOfStock){
-      return res.status(400).type("html").send(`<!doctype html><meta charset="utf-8">
-        <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
-          <h2 style="margin:0 0 8px">Sin stock</h2>
-          <p>Este producto no tiene unidades disponibles.</p>
-          <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
-        </div>`);
-    }
-  }
-
-  const currency = String(p.currency || getS("stripe_currency","USD") || "USD").toUpperCase();
-  const curLower = currency.toLowerCase();
-  const price = Number(p.price || 0);
-  const min = MINIMUMS[curLower] ?? 0.50;
-
-  if (price < min){
-    return res.type("html").send(`<!doctype html><meta charset="utf-8">
-      <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
-        <h2 style="margin:0 0 8px">Importe demasiado bajo para Stripe</h2>
-        <p>Stripe exige un mínimo de <b>${currency} ${min.toFixed(2)}</b>. 
-        Este producto cuesta <b>${currency} ${price.toFixed(2)}</b>.</p>
-        <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
-      </div>`);
-  }
-
-  // Reutiliza o crea factura PENDIENTE
-  let inv = db.prepare(`
+  // ¿Existe YA una factura pendiente del mismo producto?
+  const invPending = db.prepare(`
     SELECT * FROM invoices
     WHERE user_id=? AND product_id=? AND status IN ('pending','unpaid','overdue')
     ORDER BY datetime(created_at) DESC, id DESC
     LIMIT 1
   `).get(u.id, p.id);
 
-  if (!inv){
-    const number = (() => {
-      const now = new Date();
-      const ym = now.toISOString().slice(0,7).replace("-","");
-      const seq = db.transaction(() => {
-        db.prepare(`INSERT OR IGNORE INTO settings(key,value) VALUES('invoice_seq','0')`).run();
-        db.prepare(`UPDATE settings SET value = CAST(value AS INTEGER) + 1 WHERE key='invoice_seq'`).run();
-        return parseInt(db.prepare(`SELECT value FROM settings WHERE key='invoice_seq'`).get().value,10) || 1;
-      })();
-      return `INV-${ym}-${String(seq).padStart(4,"0")}`;
-    })();
-    const nowISO = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO invoices(number,user_id,product_id,amount,currency,status,created_at)
-      VALUES(?,?,?,?,?,'pending',?)
-    `).run(number, u.id, p.id, price, currency, nowISO);
-    inv = db.prepare(`SELECT * FROM invoices WHERE number=?`).get(number);
-  }
-  if (!inv) return res.status(500).type("text/plain").send("No se pudo generar la factura");
+  // Si NO hay factura pendiente, aplicamos tus bloqueos/stock como siempre
+  if (!invPending) {
+    // Bloqueos de recompra (igual que product.js):
+    // - single + one_time: bloquea si ya tiene activo
+    // - shared + one_time: PERMITE múltiples compras
+    // - cualquier recurrente: bloquea si ya tiene activo
+    if ((!isShared && isOneTime) || isRecurring){
+      const hasActive = !!db.prepare(`SELECT 1 FROM services WHERE user_id=? AND product_id=? AND status='active'`)
+        .get(u.id, p.id);
+      if (hasActive){
+        return res.status(400).type("html").send(
+          `<!doctype html><meta charset="utf-8"><div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
+            <h2 style="margin:0 0 8px">No disponible</h2>
+            <p>${isOneTime ? "Este producto de pago único ya fue adquirido." : "Este servicio ya está activo."}</p>
+            <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
+          </div>`
+        );
+      }
+    }
 
-  const base = absoluteBase(req);
+    // Disponibilidad (sólo para compras nuevas)
+    if (isShared){
+      if (countPoolAvailable(p.id) <= 0){
+        return res.status(400).type("html").send(`<!doctype html><meta charset="utf-8">
+          <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
+            <h2 style="margin:0 0 8px">Sin información disponible</h2>
+            <p>Este producto compartido no tiene elementos disponibles por ahora.</p>
+            <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
+          </div>`);
+      }
+    }else{
+      const outOfStock = (typeof p.stock === "number") && p.stock === 0;
+      if (outOfStock){
+        return res.status(400).type("html").send(`<!doctype html><meta charset="utf-8">
+          <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
+            <h2 style="margin:0 0 8px">Sin stock</h2>
+            <p>Este producto no tiene unidades disponibles.</p>
+            <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
+          </div>`);
+      }
+    }
+  }
+
+  // En este punto:
+  //   - si invPending existe: vamos a pagar ESA factura (saltando bloqueos/stock)
+  //   - si no existe: creamos/reutilizamos como antes
+  let inv = invPending;
+  if (!inv){
+    const currency = String(p.currency || getS("stripe_currency","USD") || "USD").toUpperCase();
+    const curLower = currency.toLowerCase();
+    const price = Number(p.price || 0);
+    const min = MINIMUMS[curLower] ?? 0.50;
+
+    if (price < min){
+      return res.type("html").send(`<!doctype html><meta charset="utf-8">
+        <div style="font-family:system-ui;max-width:680px;margin:32px auto;padding:16px">
+          <h2 style="margin:0 0 8px">Importe demasiado bajo para Stripe</h2>
+          <p>Stripe exige un mínimo de <b>${currency} ${min.toFixed(2)}</b>. 
+          Este producto cuesta <b>${currency} ${price.toFixed(2)}</b>.</p>
+          <p><a href="/product?id=${p.id}">← Volver al producto</a></p>
+        </div>`);
+    }
+
+    // Reutiliza o crea factura PENDIENTE
+    inv = db.prepare(`
+      SELECT * FROM invoices
+      WHERE user_id=? AND product_id=? AND status IN ('pending','unpaid','overdue')
+      ORDER BY datetime(created_at) DESC, id DESC
+      LIMIT 1
+    `).get(u.id, p.id);
+
+    if (!inv){
+      const number = (() => {
+        const now = new Date();
+        const ym = now.toISOString().slice(0,7).replace("-","");
+        const seq = db.transaction(() => {
+          db.prepare(`INSERT OR IGNORE INTO settings(key,value) VALUES('invoice_seq','0')`).run();
+          db.prepare(`UPDATE settings SET value = CAST(value AS INTEGER) + 1 WHERE key='invoice_seq'`).run();
+          return parseInt(db.prepare(`SELECT value FROM settings WHERE key='invoice_seq'`).get().value,10) || 1;
+        })();
+        return `INV-${ym}-${String(seq).padStart(4,"0")}`;
+      })();
+      const nowISO = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO invoices(number,user_id,product_id,amount,currency,status,created_at)
+        VALUES(?,?,?,?,?,'pending',?)
+      `).run(number, u.id, p.id, price, currency, nowISO);
+      inv = db.prepare(`SELECT * FROM invoices WHERE number=?`).get(number);
+    }
+    if (!inv) return res.status(500).type("text/plain").send("No se pudo generar la factura");
+  }
+
+  // Crear sesión con los datos correctos (si invPending, usar montos/moneda de la factura)
+  const curUpper = String(inv.currency || p.currency || "USD").toUpperCase();
+  const curLower = curUpper.toLowerCase();
+  const amount   = Number(inv.amount || p.price || 0);
 
   try{
     const cli = getStripe();
@@ -180,8 +282,8 @@ router.get("/stripe", ensureAuth, async (req, res) => {
       line_items: [{
         price_data: {
           currency: curLower,
-          product_data: { name: p.name || `Producto #${p.id}` },
-          unit_amount: Math.round(price * 100),
+          product_data: { name: (p.name || inv.number || `Producto #${p.id}`) },
+          unit_amount: Math.round(amount * 100),
         },
         quantity: 1,
       }],
@@ -203,8 +305,9 @@ router.get("/stripe", ensureAuth, async (req, res) => {
     console.error("[stripe] create-session error:", { code, msg, request_log_url: reqLog });
 
     let extra = "";
+    const min = MINIMUMS[curLower] ?? 0.50;
     if (code === "amount_too_small"){
-      const minTxt = `${currency} ${(MINIMUMS[curLower] ?? 0.50).toFixed(2)}`;
+      const minTxt = `${curUpper} ${min.toFixed(2)}`;
       extra = `<p>Stripe requiere un importe mínimo de <b>${minTxt}</b> para esta moneda.</p>`;
     }
 
@@ -260,7 +363,7 @@ router.post("/stripe/webhook", express.raw({ type: "application/json" }), (req, 
         const cycleEndISO = isRecurring ? nextDue.toISOString() : nowISO;
 
         db.transaction(() => {
-          // 1) Stock solo para SINGLE
+          // 1) Stock solo para SINGLE (se conserva tu lógica original)
           if (!isShared && typeof p.stock === "number" && p.stock >= 0) {
             db.prepare(`UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0`).run(p.id);
           }
