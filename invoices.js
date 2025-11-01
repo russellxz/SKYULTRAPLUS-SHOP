@@ -485,7 +485,7 @@ router.get("/pay/:id", ensureAuth, (req, res) => {
         <button id="paypalBtn" class="alt" type="button">PayPal</button>
 
         <!-- Stripe -->
-<a class="alt" href="/pay/stripe?pid=${inv.pid || inv.product_id}">Stripe</a>
+<a class="alt" href="/pay/stripe?invoice_id=${inv.id}">Stripe</a>
       </div>
     </section>
   </main>
