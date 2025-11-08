@@ -10,7 +10,7 @@
   "dependencies": {
     "@hapi/boom": "^10.0.1",
     "@hiudyy/ytdl": "^0.2.3",
-    "@whiskeysockets/baileys": "^6.7.21",
+    "@whiskeysockets/baileys": "^Kone457/baileys#main",
     "acrcloud": "^1.4.0",
     "awesome-phonenumber": "^5.10.0",
     "axios": "^0.24.0",
