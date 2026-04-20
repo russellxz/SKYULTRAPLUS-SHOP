@@ -1,15 +1,28 @@
 // whatsapp.js — MISMA lógica que bot-cli.js pero como módulo para el panel Admin
+// ⚡ Adaptado para Baileys ESM (itsliaaa/baileys) usando dynamic import()
 "use strict";
 
 const fs = require("fs");
 const path = require("path");
 const pino = require("pino");
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  makeCacheableSignalKeyStore,
-} = require("@whiskeysockets/baileys");
+
+/* =========================================
+   Carga perezosa de Baileys (ESM → CommonJS)
+   El fork itsliaaa/baileys es ESM-only, así que
+   tenemos que importarlo con import() dinámico.
+========================================= */
+let _baileys = null;
+async function loadBaileys() {
+  if (_baileys) return _baileys;
+  const mod = await import("@whiskeysockets/baileys");
+  _baileys = {
+    makeWASocket: mod.default || mod.makeWASocket,
+    useMultiFileAuthState: mod.useMultiFileAuthState,
+    fetchLatestBaileysVersion: mod.fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore: mod.makeCacheableSignalKeyStore,
+  };
+  return _baileys;
+}
 
 /* =========================================
    Helpers (copiados de bot-cli.js)
@@ -86,6 +99,14 @@ async function startSocketIfNeeded() {
 
   starting = (async () => {
     if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+
+    // Cargar Baileys de forma asíncrona (ESM)
+    const {
+      makeWASocket,
+      useMultiFileAuthState,
+      fetchLatestBaileysVersion,
+      makeCacheableSignalKeyStore,
+    } = await loadBaileys();
 
     const { state, saveCreds } = await useMultiFileAuthState(SESSIONS_DIR);
     stateCtl = { state, saveCreds };
